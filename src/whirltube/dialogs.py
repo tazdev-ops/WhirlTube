@@ -282,13 +282,14 @@ class DownloadOptionsWindow(Adw.Window):
         format_row.append(self.format_combo)
         self.btn_fetch = Gtk.Button(label="Fetch formats")
         format_row.append(self.btn_fetch)
-        format_action = Adw.ActionRow()
-        format_action.set_title("Available formats")
-        format_action.set_child(format_row)
-        format_group.add(format_action)
+        self._format_action = Adw.ActionRow()
+        self._format_action.set_title("Available formats")
+        self._format_action.set_child(format_row)
+        # Hide the format picker until formats are fetched
+        self._format_action.set_visible(False)
+        format_group.add(self._format_action)
         
-        # When user selects a specific format, force Quality to "Custom" for clarity
-        self.format_combo.connect("notify::selected", self._on_format_selected)
+                # When user selects a specific format, force Quality to "Custom" for clarity        self.format_combo.connect("notify::selected", self._on_format_selected)
         
         # Target directory
         dir_group = Adw.PreferencesGroup(title="Destination")
@@ -317,6 +318,10 @@ class DownloadOptionsWindow(Adw.Window):
         self._accepted = False
         self._selected_format_id = None
         self._format_map: dict[str, str] = {}
+        # Wire cookies sensitivity
+        self._wire_cookies_sensitive()
+
+        # End of constructor
 
     def _on_quality_mode_changed(self, combo: Adw.ComboRow, _pspec) -> None:
         is_custom = combo.get_selected() == 2  # "Custom" option
@@ -331,6 +336,22 @@ class DownloadOptionsWindow(Adw.Window):
     def _on_download(self, _btn) -> None:
         self._accepted = True
         self.destroy()
+
+    # --- Cookies enable/disable wiring ---
+    def _wire_cookies_sensitive(self) -> None:
+        def _apply_sensitive() -> None:
+            on = self.use_cookies.get_active()
+            self.cookies_browser.set_sensitive(on)
+            self.cookies_keyring.set_sensitive(on)
+            self.cookies_profile.set_sensitive(on)
+            self.cookies_container.set_sensitive(on)
+
+        # Initialize and connect
+        _apply_sensitive()
+        try:
+            self.use_cookies.connect("notify::active", lambda *_: _apply_sensitive())
+        except Exception:
+            pass
 
     def get_options(self) -> tuple[bool, DownloadOptions]:
         """Returns (accepted, options)"""
@@ -394,12 +415,16 @@ class DownloadOptionsWindow(Adw.Window):
     def set_formats(self, formats: list[tuple[str, str]]) -> None:
         """Update the format dropdown with available formats."""
         if not formats:
+            # Keep hidden if nothing fetched/available
+            self._format_action.set_visible(False)
             return
         
         # Create new model with "Select a format..." as first option
         strings = ["Select a format..."] + [f"{fmt_id}: {fmt_label}" for fmt_id, fmt_label in formats]
         model = Gtk.StringList.new(strings)
         self.format_combo.set_model(model)
+        # Reveal the row now that we have content
+        self._format_action.set_visible(True)
         
         # Store the mapping
         self._format_map = {f"{fmt_id}: {fmt_label}": fmt_id for fmt_id, fmt_label in formats}
