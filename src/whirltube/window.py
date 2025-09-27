@@ -26,6 +26,7 @@ from .player import has_mpv, start_mpv, mpv_send_cmd
 from .provider import YTDLPProvider
 from .invidious_provider import InvidiousProvider
 from .download_manager import DownloadManager
+from .search_filters import normalize_search_filters
 from .navigation_controller import NavigationController
 from .download_history import list_downloads
 from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
@@ -520,14 +521,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         def worker() -> None:
             try:
-                # Extract filters from settings
-                order = (self.settings.get("search_order") or "relevance")
-                duration = (self.settings.get("search_duration") or "any")
-                period = (self.settings.get("search_period") or "any")
-                # Normalize "any" to None
-                order = None if str(order).lower() == "relevance" else order
-                duration = None if str(duration).lower() == "any" else duration
-                period = None if str(period).lower() == "any" else period
+                # Normalize filters from settings to provider-friendly form
+                order, duration, period = normalize_search_filters(self.settings)
                 results = self.provider.search(query, limit=30, order=order, duration=duration, period=period)
             except Exception as e:
                 log.exception("Search failed")
@@ -780,6 +775,7 @@ class MainWindow(Adw.ApplicationWindow):
         dlg = DownloadOptionsWindow(self, video.title)
 
         def fetch_formats(_btn):
+            dlg.begin_format_fetch()
             def worker() -> None:
                 try:
                     fmts = self.provider.fetch_formats(video.url)

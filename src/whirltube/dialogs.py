@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass
 from pathlib import Path
+import shlex
 
 import gi
 
@@ -279,15 +279,22 @@ class DownloadOptionsWindow(Adw.Window):
         
         format_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.format_combo = Gtk.DropDown.new_from_strings(["Select a format..."])
+        # Disabled until formats are fetched
+        self.format_combo.set_sensitive(False)
         format_row.append(self.format_combo)
         self.btn_fetch = Gtk.Button(label="Fetch formats")
         format_row.append(self.btn_fetch)
-        self._format_action = Adw.ActionRow()
-        self._format_action.set_title("Available formats")
-        self._format_action.set_child(format_row)
-        # Hide the format picker until formats are fetched
-        self._format_action.set_visible(False)
-        format_group.add(self._format_action)
+        # Inline spinner + status for fetch
+        self._fmt_spinner = Gtk.Spinner()
+        self._fmt_spinner.set_visible(False)
+        format_row.append(self._fmt_spinner)
+        self._fmt_status = Gtk.Label(label="", xalign=0.0)
+        self._fmt_status.add_css_class("dim-label")
+        format_row.append(self._fmt_status)
+        format_action = Adw.ActionRow()
+        format_action.set_title("Available formats")
+        format_action.set_child(format_row)
+        format_group.add(format_action)
         
                 # When user selects a specific format, force Quality to "Custom" for clarity        self.format_combo.connect("notify::selected", self._on_format_selected)
         
@@ -336,6 +343,31 @@ class DownloadOptionsWindow(Adw.Window):
     def _on_download(self, _btn) -> None:
         self._accepted = True
         self.destroy()
+
+    # --- Formats fetch UX helpers ---
+    def begin_format_fetch(self) -> None:
+        try:
+            self.btn_fetch.set_sensitive(False)
+        except Exception:
+            pass
+        self._fmt_status.set_text("Fetching formats…")
+        self._fmt_spinner.set_visible(True)
+        try:
+            self._fmt_spinner.start()
+        except Exception:
+            pass
+
+    def _end_format_fetch(self) -> None:
+        try:
+            self._fmt_spinner.stop()
+        except Exception:
+            pass
+        self._fmt_spinner.set_visible(False)
+        self._fmt_status.set_text("")
+        try:
+            self.btn_fetch.set_sensitive(True)
+        except Exception:
+            pass
 
     # --- Cookies enable/disable wiring ---
     def _wire_cookies_sensitive(self) -> None:
@@ -414,18 +446,22 @@ class DownloadOptionsWindow(Adw.Window):
 
     def set_formats(self, formats: list[tuple[str, str]]) -> None:
         """Update the format dropdown with available formats."""
+        # Always end fetch UI state on return to main loop
+        self._end_format_fetch()
         if not formats:
-            # Keep hidden if nothing fetched/available
-            self._format_action.set_visible(False)
+            # Keep dropdown disabled if nothing available
+            self.format_combo.set_sensitive(False)
+            # Reset model just in case
+            self.format_combo.set_model(Gtk.StringList.new(["Select a format..."]))
             return
-        
+
         # Create new model with "Select a format..." as first option
         strings = ["Select a format..."] + [f"{fmt_id}: {fmt_label}" for fmt_id, fmt_label in formats]
         model = Gtk.StringList.new(strings)
         self.format_combo.set_model(model)
-        # Reveal the row now that we have content
-        self._format_action.set_visible(True)
-        
+        # Enable dropdown now that we have content
+        self.format_combo.set_sensitive(True)
+
         # Store the mapping
         self._format_map = {f"{fmt_id}: {fmt_label}": fmt_id for fmt_id, fmt_label in formats}
 
