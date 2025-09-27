@@ -31,7 +31,7 @@ from .navigation_controller import NavigationController
 from .download_history import list_downloads
 from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
 from .quickdownload import QuickDownloadWindow
-from .util import load_settings, save_settings, xdg_data_dir
+from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
 
 log = logging.getLogger(__name__)
 
@@ -827,6 +827,7 @@ class ResultRow(Gtk.Box):
         self.on_unfollow = on_unfollow
         self._followed = followed
         self._http_proxy = http_proxy
+        self._proxies = safe_httpx_proxy(http_proxy)
 
         self.set_margin_top(6)
         self.set_margin_bottom(6)
@@ -894,12 +895,25 @@ class ResultRow(Gtk.Box):
             GLib.idle_add(self._set_thumb_placeholder)
 
     def _load_thumb(self) -> None:
+        # Try with proxy (if valid), then fallback without
+        data: bytes | None = None
         try:
-            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._http_proxy or None) as client:
+            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies) as client:
                 r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
                 r.raise_for_status()
                 data = r.content
         except Exception:
+            data = None
+            # Fallback: retry without proxy if we had one
+            try:
+                if self._proxies:
+                    with httpx.Client(timeout=10.0, follow_redirects=True) as client2:
+                        r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
+                        r2.raise_for_status()
+                        data = r2.content
+            except Exception:
+                data = None
+        if data is None:
             GLib.idle_add(self._set_thumb_placeholder)
             return
         GLib.idle_add(self._set_thumb, data)

@@ -1,0 +1,213 @@
+diff --git a/src/whirltube/util.py b/src/whirltube/util.py
+index 4f3e13d..a2b5421 100644
+--- a/src/whirltube/util.py
++++ b/src/whirltube/util.py
+ @@ -4,8 +4,10 @@ from __future__ import annotations
+ 
+ import json
+ import os
+ from pathlib import Path
+ from typing import Any
++from urllib.parse import urlparse
++
+ 
+ APP_NAME = "whirltube"
+ 
+ def xdg_config_dir() -> Path:
+ @@ -43,3 +45,18 @@ def save_settings(data: dict[str, Any]) -> None:
+     p = settings_path()
+     tmp = p.with_suffix(".tmp")
+     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+     tmp.replace(p)
++
++def safe_httpx_proxy(val: str | None) -> str | None:
++    """
++    Validate a proxy string for httpx. Returns a usable proxy string or None.
++    Accepts schemes: http, https, socks4, socks5, socks5h.
++    """
++    if not val:
++        return None
++    s = val.strip()
++    try:
++        u = urlparse(s)
++    except Exception:
++        return None
++    scheme = (u.scheme or "").lower()
++    if scheme in {"http", "https", "socks4", "socks5", "socks5h"} and (u.netloc or u.path):
++        return s
++    return None
+diff --git a/src/whirltube/invidious_provider.py b/src/whirltube/invidious_provider.py
+index b0439a1..e22e547 100644
+--- a/src/whirltube/invidious_provider.py
++++ b/src/whirltube/invidious_provider.py
+ @@ -10,6 +10,7 @@ import httpx
+ 
+ from .models import Video
+ from .provider import YTDLPProvider, _ensure_channel_root  # reuse helpers where helpful
++from .util import safe_httpx_proxy
+ 
+ log = logging.getLogger(__name__)
+ 
+ @@ -35,7 +36,8 @@ class InvidiousProvider:
+     def _init_client(self) -> None:
+         try:
+             if self._client:
+                 self._client.close()
+         except Exception:
+             pass
+-        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=self.cfg.proxy, headers={"User-Agent": "whirltube/0.4"})
++        proxy = safe_httpx_proxy(self.cfg.proxy)
++        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=proxy, headers={"User-Agent": "whirltube/0.4"})
+diff --git a/src/whirltube/window.py b/src/whirltube/window.py
+index 4cf28f8..b9c3cf9 100644
+--- a/src/whirltube/window.py
++++ b/src/whirltube/window.py
+ @@ -35,7 +35,7 @@ from .download_manager import DownloadManager
+ from .search_filters import normalize_search_filters
+ from .navigation_controller import NavigationController
+ from .download_history import list_downloads
+ from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
+ from .quickdownload import QuickDownloadWindow
+-from .util import load_settings, save_settings, xdg_data_dir
++from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
+ 
+ log = logging.getLogger(__name__)
+ 
+ @@ -672,6 +672,7 @@ class ResultRow(Gtk.Box):
+         self.on_unfollow = on_unfollow
+         self._followed = followed
+         self._http_proxy = http_proxy
++        self._proxies = safe_httpx_proxy(http_proxy)
+ 
+         self.set_margin_top(6)
+         self.set_margin_bottom(6)
+ @@ -729,12 +730,24 @@ class ResultRow(Gtk.Box):
+         if video.thumb_url:
+             self.thumb_loader_pool.submit(self._load_thumb)
+         else:
+             # No URL -> placeholder
+             GLib.idle_add(self._set_thumb_placeholder)
+ 
+     def _load_thumb(self) -> None:
+-        try:
+-            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._http_proxy or None) as client:
++        # Try with proxy (if valid), then fallback without
++        data: bytes | None = None
++        try:
++            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies) as client:
+                 r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                 r.raise_for_status()
+                 data = r.content
+-        except Exception:
+-            GLib.idle_add(self._set_thumb_placeholder)
+-            return
++        except Exception:
++            data = None
++            # Fallback: retry without proxy if we had one
++            try:
++                if self._proxies:
++                    with httpx.Client(timeout=10.0, follow_redirects=True) as client2:
++                        r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
++                        r2.raise_for_status()
++                        data = r2.content
++            except Exception:
++                data = None
++        if data is None:
++            GLib.idle_add(self._set_thumb_placeholder)
++            return
+         GLib.idle_add(self._set_thumb, data)
+diff --git a/tests/test_utils_proxy.py b/tests/test_utils_proxy.py
+new file mode 100644
+index 0000000..4bb5f9f
+--- /dev/null
++++ b/tests/test_utils_proxy.py
+ @@ -0,0 +1,20 @@
++from whirltube.util import safe_httpx_proxy
++
++
++def test_safe_httpx_proxy_accepts_valid_http():
++    assert safe_httpx_proxy("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
++    assert safe_httpx_proxy("https://proxy.local:8443") == "https://proxy.local:8443"
++
++
++def test_safe_httpx_proxy_accepts_valid_socks():
++    assert safe_httpx_proxy("socks5://host:1080") == "socks5://host:1080"
++    assert safe_httpx_proxy("socks5h://user:pass @host:1080") == "socks5h://user:pass @host:1080"
++
++
++def test_safe_httpx_proxy_rejects_invalid():
++    assert safe_httpx_proxy("") is None
++    assert safe_httpx_proxy(None) is None
++    assert safe_httpx_proxy("not a url") is None
++    assert safe_httpx_proxy("file:///tmp/foo") is None
++    assert safe_httpx_proxy("ftp://proxy:21") is None
++    assert safe_httpx_proxy("http:///missing-host") is None
+diff --git a/tests/test_runner_state.py b/tests/test_runner_state.py
+new file mode 100644
+index 0000000..a20f3a8
+--- /dev/null
++++ b/tests/test_runner_state.py
+ @@ -0,0 +1,20 @@
++from whirltube.ytdlp_runner import YtDlpRunner
++
++
++class _StubProc:
++    def __init__(self, rc):
++        self._rc = rc
++
++    def poll(self):
++        return self._rc
++
++
++def test_runner_is_running_transitions():
++    r = YtDlpRunner(lambda _t: None)
++    assert not r.is_running()
++    # Simulate running process
++    r._proc = _StubProc(None)  # type: ignore[attr-defined]
++    assert r.is_running()
++    # Simulate finished process
++    r._proc = _StubProc(0)  # type: ignore[attr-defined]
++    assert not r.is_running()
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..dd17f3f
+--- /dev/null
++++ b/.github/workflows/ci.yml
+ @@ -0,0 +1,49 @@
++name: CI
++
++on:
++  push:
++    branches: [ main, master ]
++  pull_request:
++    branches: [ main, master ]
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        python-version: ["3.12"]
++    steps:
++      - uses: actions/checkout @v4
++      - name: Set up Python
++        uses: actions/setup-python @v5
++        with:
++          python-version: ${{ matrix.python-version }}
++          cache: 'pip'
++      - name: Install project (with dev extras)
++        run: |
++          python -m pip install --upgrade pip
++          pip install -e ".[dev]"
++      - name: Ruff
++        run: |
++          ruff --version
++          ruff check .
++      - name: Mypy
++        run: |
++          mypy --version
++          mypy
++      - name: Pytest
++        run: |
++          pytest -q
+PATCH

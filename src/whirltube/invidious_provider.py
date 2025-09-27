@@ -9,6 +9,7 @@ import httpx
 
 from .models import Video
 from .provider import YTDLPProvider  # reuse helpers where helpful
+from .util import safe_httpx_proxy
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,8 @@ class InvidiousProvider:
                 self._client.close()
         except Exception:
             pass
-        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=self.cfg.proxy, headers={"User-Agent": "whirltube/0.4"})
+        proxy = safe_httpx_proxy(self.cfg.proxy)
+        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=proxy, headers={"User-Agent": "whirltube/0.4"})
 
     # ---------- Search ----------
 
