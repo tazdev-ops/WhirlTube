@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 APP_NAME = "whirltube"
@@ -60,3 +60,31 @@ def safe_httpx_proxy(val: str | None) -> str | None:
     if scheme in {"http", "https", "socks4", "socks5", "socks5h"} and (u.netloc or u.path):
         return s
     return None
+
+def is_valid_youtube_url(url: str, allowed_hosts: Iterable[str] | None = None) -> bool:
+    """
+    Return True if the URL is http(s) and points to YouTube/YouTu.be or an explicitly
+    allowed host (e.g., an Invidious instance). This is a light validation to help
+    users avoid pasting arbitrary or unsupported URLs into "Open URL…".
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        u = urlparse(url.strip())
+    except Exception:
+        return False
+    if (u.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = (u.hostname or "").lower().strip()
+    if not host:
+        return False
+    # Core YouTube hosts
+    if host.endswith("youtube.com") or host == "youtu.be":
+        return True
+    # Extra allowed hosts (e.g., Invidious)
+    if allowed_hosts:
+        host_set = {h.lower().strip() for h in allowed_hosts if isinstance(h, str) and h.strip()}
+        # Exact hostname match
+        if host in host_set:
+            return True
+    return False

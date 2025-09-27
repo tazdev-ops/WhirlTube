@@ -6,6 +6,7 @@ import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from urllib.parse import urlparse
 from pathlib import Path
 
 import gi
@@ -31,7 +32,7 @@ from .navigation_controller import NavigationController
 from .download_history import list_downloads
 from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
 from .quickdownload import QuickDownloadWindow
-from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
+from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy, is_valid_youtube_url
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("mpv_cookies_profile", "")
         self.settings.setdefault("mpv_cookies_container", "")
 
+        self.settings.setdefault("max_concurrent_downloads", 3)
         # Initialize provider with global proxy and optional Invidious
         proxy = (self.settings.get("http_proxy") or "").strip() or None
         if bool(self.settings.get("use_invidious")):
@@ -223,6 +225,7 @@ class MainWindow(Adw.ApplicationWindow):
             show_error=self._show_error,
         )
         self.download_manager.set_download_dir(self.download_dir)
+        self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
 
         self._create_actions()
         self._set_welcome()
@@ -414,6 +417,8 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:
                 # fallback to yt-dlp
                 self.provider = YTDLPProvider(proxy or None)
+            # Update concurrency at runtime
+            self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
 
         win.connect("close-request", persist)
 
@@ -429,8 +434,9 @@ class MainWindow(Adw.ApplicationWindow):
             label="Type a search and press Enter.\nOr click Open URL / Quick Download.",
             justify=Gtk.Justification.CENTER,
         )
-        label.set_xalign(0.5)
-        label.set_yalign(0.5)
+        # Center in both axes using GTK4 halign/valign
+        label.set_halign(Gtk.Align.CENTER)
+        label.set_valign(Gtk.Align.CENTER)
         self.results_box.append(label)
         self.navigation_controller.show_view("results")
 
@@ -459,7 +465,16 @@ class MainWindow(Adw.ApplicationWindow):
                 if resp == Gtk.ResponseType.OK:
                     url = entry.get_text().strip()
                     if url:
-                        self._browse_url(url)
+                        # Allow Invidious host when "use_invidious" is enabled
+                        extra = []
+                        if bool(self.settings.get("use_invidious")):
+                            host = urlparse((self.settings.get("invidious_instance") or "").strip()).hostname
+                            if host:
+                                extra.append(host)
+                        if not is_valid_youtube_url(url, extra):
+                            self._show_error("This doesn't look like a YouTube/Invidious URL.")
+                        else:
+                            self._browse_url(url)
             finally:
                 d.destroy()
 
@@ -885,6 +900,13 @@ class ResultRow(Gtk.Box):
                         pass
                 follow_btn.connect("clicked", _toggle_follow)
                 btn_box.append(follow_btn)
+        # Common actions: open in browser, copy URL
+        open_web = Gtk.Button(label="Open in Browser")
+        open_web.connect("clicked", lambda *_: self._open_in_browser())
+        copy_url = Gtk.Button(label="Copy URL")
+        copy_url.connect("clicked", lambda *_: self._copy_url())
+        btn_box.append(open_web)
+        btn_box.append(copy_url)
         self.append(btn_box)
 
         # Load thumbnail
@@ -945,12 +967,30 @@ class ResultRow(Gtk.Box):
         ph.set_size_request(160, 90)
         ph.set_halign(Gtk.Align.FILL)
         ph.set_valign(Gtk.Align.FILL)
-        lbl = Gtk.Label(label="No thumbnail", xalign=0.5, yalign=0.5)
+        lbl = Gtk.Label(label="No thumbnail")
+        # Center the placeholder label
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_valign(Gtk.Align.CENTER)
         lbl.add_css_class("dim-label")
         lbl.set_wrap(True)
         ph.append(lbl)
         # Put the placeholder at the start (thumbnail slot)
         self.prepend(ph)
+
+    def _open_in_browser(self) -> None:
+        try:
+            if self.video and self.video.url:
+                Gio.AppInfo.launch_default_for_uri(self.video.url, None)
+        except Exception:
+            pass
+
+    def _copy_url(self) -> None:
+        try:
+            disp = Gdk.Display.get_default()
+            if disp and self.video and self.video.url:
+                disp.get_clipboard().set_text(self.video.url)
+        except Exception:
+            pass
 
 def _fmt_meta(v: Video) -> str:
     ch = v.channel or "Unknown channel"

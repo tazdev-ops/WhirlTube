@@ -552,6 +552,17 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_proxy.set_text(settings.get("http_proxy", ""))
         group_net.add(self.entry_proxy)
 
+        # Queue / concurrency
+        group_queue = Adw.PreferencesGroup(title="Queue")
+        page_dl.add(group_queue)
+        self.spin_concurrent = Adw.SpinRow.new_with_range(1, 8, 1)
+        self.spin_concurrent.set_title("Max concurrent downloads")
+        try:
+            self.spin_concurrent.set_value(float(int(settings.get("max_concurrent_downloads", 3) or 3)))
+        except Exception:
+            self.spin_concurrent.set_value(3.0)
+        group_queue.add(self.spin_concurrent)
+
         self.add(page_play)
         self.add(page_dl)
 
@@ -589,4 +600,6 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.settings["mpv_cookies_container"] = self.entry_container.get_text()
         # Global proxy
         self.settings["http_proxy"] = self.entry_proxy.get_text()
+        # Concurrency
+        self.settings["max_concurrent_downloads"] = int(self.spin_concurrent.get_value())
         return False
