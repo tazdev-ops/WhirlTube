@@ -40,6 +40,7 @@ include = [
 include = [
   "src/**",
   "README.md",
+  "CHANGELOG.md",
   "LICENSE",
   "pyproject.toml",
   "mypy.ini",

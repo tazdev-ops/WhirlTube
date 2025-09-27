@@ -32,6 +32,7 @@ class DownloadTask:
     _thread: threading.Thread | None = field(default=None, init=False)
     ydl_opts_override: dict | None = None  # allow per-download overrides
     _cancel: Event = field(default_factory=Event, init=False)
+    _outtmpl_template: str | None = None
 
     def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
         """Start the download in a background thread using yt-dlp Python API."""
@@ -61,7 +62,8 @@ class DownloadTask:
         def run() -> None:
             self.progress.status = "downloading"
             on_update(self.progress)
-            outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
+            template = self._outtmpl_template or "%(title)s.%(ext)s"
+            outtmpl = str(self.dest_dir / template)
             ydl_opts = {
                 "quiet": True,
                 "outtmpl": outtmpl,
@@ -95,6 +97,12 @@ class DownloadTask:
         except Exception:
             pass
         # Thread will exit after yt-dlp aborts; no force-termination here
+
+    def set_outtmpl_template(self, tmpl: str | None) -> None:
+        try:
+            self._outtmpl_template = (tmpl or "").strip() or None
+        except Exception:
+            self._outtmpl_template = None
 
 
 class SubprocessDownloadTask:
@@ -174,11 +182,12 @@ class RunnerDownloadTask:
     Advanced download using YtDlpRunner (shared JSON progress template).
     Unifies progress handling with Quick Download.
     """
-    def __init__(self, video: Video, dest_dir: Path, cli_args: list[str], bin_path: str | None = None) -> None:
+    def __init__(self, video: Video, dest_dir: Path, cli_args: list[str], bin_path: str | None = None, outtmpl_template: str | None = None) -> None:
         self.video = video
         self.dest_dir = dest_dir
         self.cli_args = cli_args
         self.progress = DownloadProgress(status="queued")
+        self._outtmpl_template = (outtmpl_template or "").strip() or None
         self._runner = YtDlpRunner(self._on_progress_line)
         self._watcher: threading.Thread | None = None
         self._bin_path = bin_path
@@ -198,7 +207,8 @@ class RunnerDownloadTask:
             on_update(self.progress)
             return
 
-        outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
+        template = self._outtmpl_template or "%(title)s.%(ext)s"
+        outtmpl = str(self.dest_dir / template)
         args = ["-o", outtmpl] + self.cli_args + [self.video.url]
         self._runner.start(args, bin_path=self._bin_path)
 

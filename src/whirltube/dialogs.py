@@ -479,6 +479,13 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # Provider page
         page_provider = Adw.PreferencesPage(title="Provider")
 
+        # Auto-hide MPV controls
+        self.autohide_controls = Adw.SwitchRow(
+            title="Auto-hide MPV controls outside Player view"
+        )
+        self.autohide_controls.set_active(bool(settings.get("mpv_autohide_controls", False)))
+        group_play.add(self.autohide_controls)
+
         # Playback mode
         self.playback_mode = Adw.ComboRow(
             title="Default playback mode",
@@ -559,6 +566,12 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.download_button.connect("activated", self._choose_dir)
         group_dl.add(self.download_button)
 
+        # Filename template
+        self.entry_template = Adw.EntryRow(title="Filename template")
+        self.entry_template.set_text(settings.get("download_template", "%(title)s.%(ext)s"))
+        self.entry_template.set_tooltip_text("yt-dlp template, e.g. %(title)s.%(ext)s or %(uploader)s/%(title)s.%(ext)s")
+        group_dl.add(self.entry_template)
+
         # Network (global)
         group_net = Adw.PreferencesGroup(title="Network")
         page_dl.add(group_net)
@@ -620,4 +633,7 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # Provider settings
         self.settings["use_invidious"] = bool(self.use_invidious.get_active())
         self.settings["invidious_instance"] = self.entry_invidious.get_text().strip() or "https://yewtu.be"
+        # Auto-hide MPV controls
+        self.settings["mpv_autohide_controls"] = bool(self.autohide_controls.get_active())
+        self.settings["download_template"] = self.entry_template.get_text().strip() or "%(title)s.%(ext)s"
         return False

@@ -20,6 +20,18 @@ from .download_history import add_download
 
 log = logging.getLogger(__name__)
 
+def _notify(summary: str) -> None:
+    # Best-effort desktop notification without requiring GI at import time.
+    try:
+        import gi
+        gi.require_version("Notify", "0.7")
+        from gi.repository import Notify
+        Notify.init("whirltube")
+        n = Notify.Notification.new(summary)
+        n.show()
+    except Exception:
+        pass
+
 class DownloadRow(Gtk.Box):
     def __init__(self, task: Any | None = None, title: str | None = None, on_cancel: Callable[[], None] | None = None, on_retry: Callable[[], None] | None = None, on_remove: Callable[[], None] | None = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -42,28 +54,30 @@ class DownloadRow(Gtk.Box):
         self.progress = Gtk.ProgressBar(show_text=True)
         self.status = Gtk.Label(label="", xalign=0.0)
 
-        # Actions row (open folder/file)
+        # Actions popover menu
         self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.btn_cancel = Gtk.Button(label="Cancel")
-        self.btn_cancel.connect("clicked", lambda *_: self._on_cancel_clicked())
-        self.btn_retry = Gtk.Button(label="Retry")
-        self.btn_retry.set_sensitive(False)
-        self.btn_retry.connect("clicked", lambda *_: self._on_retry_clicked())
-        self.btn_remove = Gtk.Button(label="Remove")
-        self.btn_remove.set_sensitive(False)
-        self.btn_remove.connect("clicked", lambda *_: self._on_remove_clicked())
-        self.btn_open_folder = Gtk.Button(label="Open folder")
-        self.btn_open_folder.set_sensitive(False)
-        self.btn_open_folder.connect("clicked", self._open_folder)
-        self.btn_open_file = Gtk.Button(label="Open file")
-        self.btn_open_file.set_sensitive(False)
-        self.btn_open_file.connect("clicked", self._open_file)
-
-        self.actions.append(self.btn_cancel)
-        self.actions.append(self.btn_retry)
-        self.actions.append(self.btn_remove)
-        self.actions.append(self.btn_open_folder)
-        self.actions.append(self.btn_open_file)
+        self.menu_btn = Gtk.MenuButton(label="Actions")
+        pop = Gtk.Popover()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        self._btn_m_cancel = Gtk.Button(label="Cancel")
+        self._btn_m_cancel.connect("clicked", lambda *_: self._on_cancel_clicked())
+        self._btn_m_retry = Gtk.Button(label="Retry")
+        self._btn_m_retry.set_sensitive(False)
+        self._btn_m_retry.connect("clicked", lambda *_: self._on_retry_clicked())
+        self._btn_m_remove = Gtk.Button(label="Remove")
+        self._btn_m_remove.set_sensitive(False)
+        self._btn_m_remove.connect("clicked", lambda *_: self._on_remove_clicked())
+        self._btn_m_open_folder = Gtk.Button(label="Open folder")
+        self._btn_m_open_folder.connect("clicked", self._open_folder)
+        self._btn_m_show_containing = Gtk.Button(label="Show in folder")
+        self._btn_m_show_containing.connect("clicked", self._show_in_folder)
+        self._btn_m_open_file = Gtk.Button(label="Open file")
+        self._btn_m_open_file.connect("clicked", self._open_file)
+        for b in (self._btn_m_cancel, self._btn_m_retry, self._btn_m_remove, self._btn_m_open_folder, self._btn_m_show_containing, self._btn_m_open_file):
+            vbox.append(b)
+        pop.set_child(vbox)
+        self.menu_btn.set_popover(pop)
+        self.actions.append(self.menu_btn)
 
         self.append(self.label)
         self.append(self.progress)
@@ -76,7 +90,7 @@ class DownloadRow(Gtk.Box):
                 self._on_cancel()
         finally:
             # Disable cancel to avoid repeated presses
-            self.btn_cancel.set_sensitive(False)
+            self._btn_m_cancel.set_sensitive(False)
 
     def _on_retry_clicked(self) -> None:
         try:
@@ -138,20 +152,21 @@ class DownloadRow(Gtk.Box):
         self.status.set_text(_fmt_dl_status(p))
 
         if p.status == "finished":
-            # Enable actions
-            self.btn_open_folder.set_sensitive(True)
-            if p.filename:
-                self.btn_open_file.set_sensitive(True)
-            # Disable cancel when done
-            self.btn_cancel.set_sensitive(False)
-            self.btn_retry.set_sensitive(False)
-            self.btn_remove.set_sensitive(True)
+            # Adjust menu item sensitivity
+            self._btn_m_cancel.set_sensitive(False)
+            self._btn_m_retry.set_sensitive(False)
+            self._btn_m_remove.set_sensitive(True)
+            self._btn_m_open_folder.set_sensitive(True)
+            self._btn_m_open_file.set_sensitive(True)
+            self._btn_m_show_containing.set_sensitive(True)
             self._state = "finished"
         elif p.status == "error":
             # Disable cancel after error
-            self.btn_cancel.set_sensitive(False)
-            self.btn_retry.set_sensitive(True)
-            self.btn_remove.set_sensitive(True)
+            self._btn_m_cancel.set_sensitive(False)
+            self._btn_m_retry.set_sensitive(True)
+            self._btn_m_remove.set_sensitive(True)
+            self._btn_m_open_folder.set_sensitive(True)
+            self._btn_m_show_containing.set_sensitive(True)
             self._state = "error"
 
     def _open_folder(self, *_a) -> None:
@@ -182,11 +197,27 @@ class DownloadRow(Gtk.Box):
             self.status.set_text("Cancelled")
             self.progress.set_fraction(0.0)
             self.progress.set_text("")
-            self.btn_cancel.set_sensitive(False)
-            self.btn_retry.set_sensitive(True)
-            self.btn_remove.set_sensitive(True)
-            # Keep folder/file buttons disabled
+            self._btn_m_cancel.set_sensitive(False)
+            self._btn_m_retry.set_sensitive(True)
+            self._btn_m_remove.set_sensitive(True)
+            self._btn_m_open_folder.set_sensitive(True)
+            self._btn_m_show_containing.set_sensitive(True)
             self._state = "cancelled"
+        except Exception:
+            pass
+
+    def _show_in_folder(self, *_a) -> None:
+        try:
+            p: DownloadProgress = getattr(self.task, "progress", None)
+            if p and p.filename:
+                fp = Path(p.filename)
+                # If not absolute, try resolve against dest_dir
+                dest: Path = getattr(self.task, "dest_dir", None)
+                if not fp.is_absolute() and isinstance(dest, Path):
+                    fp = dest / fp
+                parent = fp.parent
+                if parent.exists():
+                    Gio.AppInfo.launch_default_for_uri(f"file://{parent}", None)
         except Exception:
             pass
 
@@ -219,11 +250,12 @@ def _fmt_dl_status(p: DownloadProgress) -> str:
 
 
 class DownloadManager:
-    def __init__(self, downloads_box: Gtk.Box, show_downloads_view: Callable[[], None], get_setting: Callable[[str], str|bool|int|None], show_error: Callable[[str], None]) -> None:
+    def __init__(self, downloads_box: Gtk.Box, show_downloads_view: Callable[[], None], get_setting: Callable[[str], str|bool|int|None], show_error: Callable[[str], None], show_toast: Callable[[str], None] | None = None) -> None:
         self.downloads_box = downloads_box
         self.show_downloads_view = show_downloads_view
         self.get_setting = get_setting
         self.show_error = show_error
+        self.show_toast = show_toast or (lambda _s: None)
         self.download_dir: Path | None = None # This will be set by MainWindow
         self._max_concurrent: int = 3
         self._active: int = 0
@@ -391,6 +423,9 @@ class DownloadManager:
                                 add_download(video, dest_dir, p.filename)
                             except Exception:
                                 pass
+                            self.show_toast(f"Downloaded: {video.title}")
+                        elif p.status == "error":
+                            self.show_toast(f"Download failed: {video.title}")
                     finally:
                         self._active = max(0, self._active - 1)
                         self._maybe_start_next()
@@ -407,7 +442,8 @@ class DownloadManager:
             ytdlp_path = self.get_setting("ytdlp_path")
             if not isinstance(ytdlp_path, str) or not ytdlp_path.strip():
                 ytdlp_path = None
-            task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path)
+            template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
+            task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path, outtmpl_template=template)
             row.attach_task(task)
             # Update cancel binding to running task
             row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
@@ -419,7 +455,9 @@ class DownloadManager:
         if isinstance(proxy, str) and proxy.strip():
             ydl_override["proxy"] = proxy.strip()
 
+        template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
         dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
+        dl_task.set_outtmpl_template(template)
         row.attach_task(dl_task)
         row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
         dl_task.start(_on_update)

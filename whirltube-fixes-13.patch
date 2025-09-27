@@ -1,0 +1,444 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 64a0c56..ca0493a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -41,6 +41,7 @@ include = [
+   "src/**",
+   "README.md",
++  "CHANGELOG.md",
+   "LICENSE",
+   "pyproject.toml",
+   "mypy.ini",
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..3d3c65c
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,38 @@
++# Changelog
++
++All notable changes to this project will be documented in this file.
++
++## 0.4.5
++- Downloads:
++  - Cleaner UI: actions moved into an "Actions" popover menu (Cancel, Retry, Remove, Open/Show in folder).
++  - Configurable filename template (Preferences → Downloads).
++  - Queue, Cancel All, Clear Finished, Retry/Remove rows (from previous batches).
++  - In-app toasts and desktop notifications on finish/error (from previous batches).
++- Player:
++  - "Auto-hide MPV controls outside Player view" setting (Preferences → Playback).
++  - MPV hotkeys (J/K/L, +/- , X) and Copy URL @ time (T) (from previous batches).
++- Provider:
++  - Invidious toggle and instance (Preferences → Provider) (from previous batches).
++- Packaging:
++  - Desktop file, AppStream metainfo, Flatpak scaffold (from previous batches).
++- Internal:
++  - Safer proxy handling and test coverage.
++  - Lazy GI imports for testability.
++
++## 0.4.4
++- Downloads:
++  - Retry/Remove per row, Cancel All and Clear Finished menu items.
++- Provider:
++  - Wire Subscriptions menu actions.
++
++## 0.4.3
++- Downloads:
++  - Queue with configurable max concurrency.
++  - "Open in Browser", "Copy URL", "Copy Title".
++- Misc: URL validation and alignment fixes.
++
++## 0.4.2
++- Initial public release series baseline.
+diff --git a/src/whirltube/__init__.py b/src/whirltube/__init__.py
+index f5dba0b..7f1778f 100644
+--- a/src/whirltube/__init__.py
++++ b/src/whirltube/__init__.py
+@@ -1,5 +1,5 @@
+from __future__ import annotations
+
+__all__ = ["__version__"]
+-__version__ = "0.4.4"
++__version__ = "0.4.5"
+diff --git a/src/whirltube/dialogs.py b/src/whirltube/dialogs.py
+index b4ed200..5f8f052 100644
+--- a/src/whirltube/dialogs.py
++++ b/src/whirltube/dialogs.py
+@@ -31,6 +31,13 @@ class PreferencesWindow(Adw.PreferencesWindow):
+        page_play.add(group_play)
+
++        # Auto-hide MPV controls
++        self.autohide_controls = Adw.SwitchRow(
++            title="Auto-hide MPV controls outside Player view"
++        )
++        self.autohide_controls.set_active(bool(settings.get("mpv_autohide_controls", False)))
++        group_play.add(self.autohide_controls)
++
+        # Playback mode
+        self.playback_mode = Adw.ComboRow(
+            title="Default playback mode",
+            model=Gtk.StringList.new(["External MPV", "In-window (X11 only)"]),
+        )
+@@ -101,6 +108,13 @@ class PreferencesWindow(Adw.PreferencesWindow):
+        group_dl = Adw.PreferencesGroup(title="Location")
+        page_dl.add(group_dl)
+
++        # Filename template
++        self.entry_template = Adw.EntryRow(title="Filename template")
++        self.entry_template.set_text(settings.get("download_template", "%(title)s.%(ext)s"))
++        self.entry_template.set_tooltip_text("yt-dlp template, e.g. %(title)s.%(ext)s or %(uploader)s/%(title)s.%(ext)s")
++        group_dl.add(self.entry_template)
++
+        self.download_button = Adw.ActionRow(title="Download directory")
+        self._download_dir_label = Gtk.Label(label=settings.get("download_dir", ""), xalign=1.0)
+        self.download_button.add_suffix(self._download_dir_label)
+@@ -167,6 +181,9 @@ class PreferencesWindow(Adw.PreferencesWindow):
+        self.settings["mpv_cookies_container"] = self.entry_container.get_text()
+        # Global proxy
+        self.settings["http_proxy"] = self.entry_proxy.get_text()
++        # Auto-hide MPV controls
++        self.settings["mpv_autohide_controls"] = bool(self.autohide_controls.get_active())
++        self.settings["download_template"] = self.entry_template.get_text().strip() or "%(title)s.%(ext)s"
+        # Concurrency
+        self.settings["max_concurrent_downloads"] = int(self.spin_concurrent.get_value())
+        # Provider settings
+        self.settings["use_invidious"] = bool(self.use_invidious.get_active())
+diff --git a/src/whirltube/downloader.py b/src/whirltube/downloader.py
+index d0af8bb..ef36a17 100644
+--- a/src/whirltube/downloader.py
++++ b/src/whirltube/downloader.py
+@@ -34,6 +34,7 @@ class DownloadTask:
+    progress: DownloadProgress = field(default_factory=DownloadProgress)
+    _thread: threading.Thread | None = field(default=None, init=False)
+    ydl_opts_override: dict | None = None  # allow per-download overrides
+    _cancel: Event = field(default_factory=Event, init=False)
++   _outtmpl_template: str | None = None
+
+    def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
+        """Start the download in a background thread using yt-dlp Python API."""
+        if self._thread and self._thread.is_alive():
+            return
+@@ -66,10 +67,11 @@ class DownloadTask:
+        def run() -> None:
+            self.progress.status = "downloading"
+            on_update(self.progress)
+-           outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
++           template = self._outtmpl_template or "%(title)s.%(ext)s"
++           outtmpl = str(self.dest_dir / template)
+            ydl_opts = {
+                "quiet": True,
+                "outtmpl": outtmpl,
+                "progress_hooks": [hook],
+                "merge_output_format": "mp4",
+@@ -88,6 +90,11 @@ class DownloadTask:
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
++   def set_outtmpl_template(self, tmpl: str | None) -> None:
++       try:
++           self._outtmpl_template = (tmpl or "").strip() or None
++       except Exception:
++           self._outtmpl_template = None
+    def stop(self) -> None:
+        """
+        Best-effort cancellation. For Python API we signal via hook and let yt-dlp abort soon.
+        """
+@@ -176,11 +183,13 @@ class RunnerDownloadTask:
+    Advanced download using YtDlpRunner (shared JSON progress template).
+    Unifies progress handling with Quick Download.
+    """
+-   def __init__(self, video: Video, dest_dir: Path, cli_args: list[str], bin_path: str | None = None) -> None:
++   def __init__(self, video: Video, dest_dir: Path, cli_args: list[str], bin_path: str | None = None, outtmpl_template: str | None = None) -> None:
+        self.video = video
+        self.dest_dir = dest_dir
+        self.cli_args = cli_args
+        self.progress = DownloadProgress(status="queued")
++       self._outtmpl_template = (outtmpl_template or "").strip() or None
+        self._runner = YtDlpRunner(self._on_progress_line)
+        self._watcher: threading.Thread | None = None
+        self._bin_path = bin_path
+        self._on_update: Callable[[DownloadProgress], None] | None = None
+@@ -197,7 +206,8 @@ class RunnerDownloadTask:
+            on_update(self.progress)
+            return
+
+-       outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
++       template = self._outtmpl_template or "%(title)s.%(ext)s"
++       outtmpl = str(self.dest_dir / template)
+        args = ["-o", outtmpl] + self.cli_args + [self.video.url]
+        self._runner.start(args, bin_path=self._bin_path)
+
+diff --git a/src/whirltube/window.py b/src/whirltube/window.py
+index 3b4c309..c9c1c8f 100644
+--- a/src/whirltube/window.py
++++ b/src/whirltube/window.py
+@@ -78,6 +78,8 @@ class MainWindow(Adw.ApplicationWindow):
+        self.settings.setdefault("mpv_cookies_container", "")
+
+        self.settings.setdefault("max_concurrent_downloads", 3)
++       self.settings.setdefault("mpv_autohide_controls", False)
++       self.settings.setdefault("download_template", "%(title)s.%(ext)s")
+        # Window size persistence
+        self.settings.setdefault("win_w", 1080)
+        self.settings.setdefault("win_h", 740)
+@@ -209,6 +211,8 @@ class MainWindow(Adw.ApplicationWindow):
+        # Save settings on window close
+        self.connect("close-request", self._on_main_close)
++       # React to stack page changes for MPV controls visibility
++       self.stack.connect("notify::visible-child", self._on_stack_changed)
+
+    def _show_toast(self, text: str) -> None:
+        try:
+@@ -353,6 +357,12 @@ class MainWindow(Adw.ApplicationWindow):
+            except Exception:
+                # fallback to yt-dlp
+                self.provider = YTDLPProvider(proxy or None)
+            # Update concurrency at runtime
+            self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
++           # Update MPV controls visibility preference immediately
++           self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+
+        win.connect("close-request", persist)
+@@ -575,7 +585,7 @@ class MainWindow(Adw.ApplicationWindow):
+            self._mpv_proc = proc
+            self._mpv_ipc = ipc_path
+            self._mpv_speed = 1.0
+            self._mpv_current_url = video.url
+-           self.ctrl_bar.set_visible(True)
++           self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+            # Enable stop action (and implicitly other mpv actions if desired)
+            try: self._act_stop_mpv.set_enabled(True)
+            except Exception: pass
+@@ -612,6 +622,20 @@ class MainWindow(Adw.ApplicationWindow):
+        except Exception:
+            pass
+        self._show_toast(f"Copied URL at {pos}s")
+
++   def _is_mpv_controls_visible(self) -> bool:
++       # Only show controls if MPV running
++       if self._mpv_proc is None:
++           return False
++       # honor autohide preference: show only on player view when enabled
++       if bool(self.settings.get("mpv_autohide_controls")):
++           return (self.stack.get_visible_child_name() == "player")
++       return True
++
++   def _on_stack_changed(self, *_a) -> None:
++       try:
++           self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
++       except Exception:
++           pass
+    def _mpv_cookie_arg(self) -> str:
+        browser = (self.settings.get("mpv_cookies_browser") or "").strip()
+        if not browser:
+            return ""
+diff --git a/src/whirltube/download_manager.py b/src/whirltube/download_manager.py
+index 6f0fdb9..9c314f2 100644
+--- a/src/whirltube/download_manager.py
++++ b/src/whirltube/download_manager.py
+@@ -30,32 +30,23 @@ def _notify(summary: str) -> None:
+        pass
+
+class DownloadRow(Gtk.Box):
+-   def __init__(self, task: Any | None = None, title: str | None = None, on_cancel: Callable[[], None] | None = None, on_retry: Callable[[], None] | None = None, on_remove: Callable[[], None] | None = None) -> None:
++   def __init__(self, task: Any | None = None, title: str | None = None, on_cancel: Callable[[], None] | None = None, on_retry: Callable[[], None] | None = None, on_remove: Callable[[], None] | None = None) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.task = task
+        self._base_title = title or getattr(getattr(task, "video", None), "title", "Download")
+        self._on_cancel = on_cancel
+        self._on_retry = on_retry
+        self._on_remove = on_remove
+        # Metadata for retry
+        self._video: Video | None = None
+        self._opts: DownloadOptions | None = None
+        self._dest_dir: Path | None = None
+        self._state: str = "queued" if task is None else "downloading"
+
+        self.set_margin_top(6)
+        self.set_margin_bottom(6)
+
+-       start_label = "Downloading" if task else "Queued"
+-       self.label = Gtk.Label(label=f"{start_label}: {self._base_title}", xalign=0.0, wrap=True)
++       start_label = "Downloading" if task else "Queued"
++       self.label = Gtk.Label(label=f"{start_label}: {self._base_title}", xalign=0.0, wrap=True)
+        self.progress = Gtk.ProgressBar(show_text=True)
+        self.status = Gtk.Label(label="", xalign=0.0)
+
+-       # Actions row (open folder/file)
+-       self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+-       self.btn_cancel = Gtk.Button(label="Cancel")
+-       self.btn_cancel.connect("clicked", lambda *_: self._on_cancel_clicked())
+-       self.btn_retry = Gtk.Button(label="Retry")
+-       self.btn_retry.set_sensitive(False)
+-       self.btn_retry.connect("clicked", lambda *_: self._on_retry_clicked())
+-       self.btn_remove = Gtk.Button(label="Remove")
+-       self.btn_remove.set_sensitive(False)
+-       self.btn_remove.connect("clicked", lambda *_: self._on_remove_clicked())
+-       self.btn_open_folder = Gtk.Button(label="Open folder")
+-       self.btn_open_folder.set_sensitive(False)
+-       self.btn_open_folder.connect("clicked", self._open_folder)
+-       self.btn_show_containing = Gtk.Button(label="Show in folder")
+-       self.btn_show_containing.set_sensitive(False)
+-       self.btn_show_containing.connect("clicked", self._show_in_folder)
+-       self.btn_open_file = Gtk.Button(label="Open file")
+-       self.btn_open_file.set_sensitive(False)
+-       self.btn_open_file.connect("clicked", self._open_file)
+-
+-       self.actions.append(self.btn_cancel)
+-       self.actions.append(self.btn_retry)
+-       self.actions.append(self.btn_remove)
+-       self.actions.append(self.btn_open_folder)
+-       self.actions.append(self.btn_show_containing)
+-       self.actions.append(self.btn_open_file)
++       # Actions popover menu
++       self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
++       self.menu_btn = Gtk.MenuButton(label="Actions")
++       pop = Gtk.Popover()
++       vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
++       self._btn_m_cancel = Gtk.Button(label="Cancel")
++       self._btn_m_cancel.connect("clicked", lambda *_: self._on_cancel_clicked())
++       self._btn_m_retry = Gtk.Button(label="Retry")
++       self._btn_m_retry.set_sensitive(False)
++       self._btn_m_retry.connect("clicked", lambda *_: self._on_retry_clicked())
++       self._btn_m_remove = Gtk.Button(label="Remove")
++       self._btn_m_remove.set_sensitive(False)
++       self._btn_m_remove.connect("clicked", lambda *_: self._on_remove_clicked())
++       self._btn_m_open_folder = Gtk.Button(label="Open folder")
++       self._btn_m_open_folder.connect("clicked", self._open_folder)
++       self._btn_m_show_containing = Gtk.Button(label="Show in folder")
++       self._btn_m_show_containing.connect("clicked", self._show_in_folder)
++       self._btn_m_open_file = Gtk.Button(label="Open file")
++       self._btn_m_open_file.connect("clicked", self._open_file)
++       for b in (self._btn_m_cancel, self._btn_m_retry, self._btn_m_remove, self._btn_m_open_folder, self._btn_m_show_containing, self._btn_m_open_file):
++           vbox.append(b)
++       pop.set_child(vbox)
++       self.menu_btn.set_popover(pop)
++       self.actions.append(self.menu_btn)
+
+        self.append(self.label)
+        self.append(self.progress)
+        self.append(self.status)
+        self.append(self.actions)
+@@ -65,9 +56,9 @@ class DownloadRow(Gtk.Box):
+    def _on_cancel_clicked(self) -> None:
+        try:
+            if self._on_cancel:
+                self._on_cancel()
+        finally:
+-           # Disable cancel to avoid repeated presses
+-           self.btn_cancel.set_sensitive(False)
++           # Disable cancel to avoid repeated presses
++           self._btn_m_cancel.set_sensitive(False)
+
+    def _on_retry_clicked(self) -> None:
+        try:
+            if self._on_retry:
+                self._on_retry()
+@@ -98,6 +89,7 @@ class DownloadRow(Gtk.Box):
+        self.progress.set_fraction(0.0)
+        self.progress.set_text("")
+        self.status.set_text("")
+        self._state = "queued"
+        except Exception:
+            pass
+@@ -123,6 +115,9 @@ class DownloadRow(Gtk.Box):
+        # Switch label when we get the first real progress
+        if p.status == "downloading":
+            try:
+                self.label.set_text(f"Downloading: {self._base_title}")
+            except Exception:
+                pass
+            self._state = "downloading"
+        frac = 0.0
+@@ -136,22 +131,22 @@ class DownloadRow(Gtk.Box):
+        self.status.set_text(_fmt_dl_status(p))
+
+        if p.status == "finished":
+-           # Enable actions
+-           self.btn_open_folder.set_sensitive(True)
+-           if p.filename:
+-               self.btn_open_file.set_sensitive(True)
+-           # Disable cancel when done
+-           self.btn_cancel.set_sensitive(False)
+-           self.btn_retry.set_sensitive(False)
+-           self.btn_remove.set_sensitive(True)
++           # Adjust menu item sensitivity
++           self._btn_m_cancel.set_sensitive(False)
++           self._btn_m_retry.set_sensitive(False)
++           self._btn_m_remove.set_sensitive(True)
++           self._btn_m_open_folder.set_sensitive(True)
++           self._btn_m_open_file.set_sensitive(True)
++           self._btn_m_show_containing.set_sensitive(True)
+            self._state = "finished"
+        elif p.status == "error":
+            # Disable cancel after error
+-           self.btn_cancel.set_sensitive(False)
+-           self.btn_retry.set_sensitive(True)
+-           self.btn_remove.set_sensitive(True)
++           self._btn_m_cancel.set_sensitive(False)
++           self._btn_m_retry.set_sensitive(True)
++           self._btn_m_remove.set_sensitive(True)
++           self._btn_m_open_folder.set_sensitive(True)
++           self._btn_m_show_containing.set_sensitive(True)
+            self._state = "error"
+
+    def _open_folder(self, *_a) -> None:
+        try:
+            dest = getattr(self.task, "dest_dir", None)
+            if isinstance(dest, Path) and dest.exists():
+                Gio.AppInfo.launch_default_for_uri(f"file://{dest}", None)
+        except Exception:
+            pass
+@@ -168,18 +163,18 @@ class DownloadRow(Gtk.Box):
+        self.progress.set_text("")
+-       self.btn_cancel.set_sensitive(False)
+-       # Keep folder/file buttons disabled
+-       self.btn_retry.set_sensitive(True)
+-       self.btn_remove.set_sensitive(True)
++       self._btn_m_cancel.set_sensitive(False)
++       self._btn_m_retry.set_sensitive(True)
++       self._btn_m_remove.set_sensitive(True)
++       self._btn_m_open_folder.set_sensitive(True)
++       self._btn_m_show_containing.set_sensitive(True)
+        self._state = "cancelled"
+        except Exception:
+            pass
+
+    def state(self) -> str:
+        return self._state
+@@ -240,6 +235,7 @@ class DownloadManager:
+        row.set_queued()
+        row.set_metadata(video, opts, dest_dir)
+        self.downloads_box.append(row)
+        self._rows.append(row)
+        self.show_downloads_view()
+        # Enqueue and attempt to start
+        self._queue.append((video, opts, dest_dir, row))
+        self._maybe_start_next()
+@@ -376,7 +372,9 @@ class DownloadManager:
+            if isinstance(proxy, str) and proxy.strip() and "--proxy" not in cli:
+                cli = ["--proxy", proxy.strip()] + cli
+            # Optional custom yt-dlp binary path from settings
+            ytdlp_path = self.get_setting("ytdlp_path")
+            if not isinstance(ytdlp_path, str) or not ytdlp_path.strip():
+                ytdlp_path = None
+-           task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path)
++           template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
++           task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path, outtmpl_template=template)
+            row.attach_task(task)
+            # Update cancel binding to running task
+            row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
+            task.start(_on_update)
+            return
+@@ -388,8 +386,10 @@ class DownloadManager:
+        if isinstance(proxy, str) and proxy.strip():
+            ydl_override["proxy"] = proxy.strip()
+
+-       dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
++       template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
++       dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
++       dl_task.set_outtmpl_template(template)
+        row.attach_task(dl_task)
+        row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
+        dl_task.start(_on_update)
+        return

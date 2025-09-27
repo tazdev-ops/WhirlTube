@@ -63,6 +63,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("mpv_cookies_container", "")
 
         self.settings.setdefault("max_concurrent_downloads", 3)
+        self.settings.setdefault("mpv_autohide_controls", False)
+        self.settings.setdefault("download_template", "%(title)s.%(ext)s")
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
         self.settings.setdefault("win_h", 740)
@@ -234,6 +236,7 @@ class MainWindow(Adw.ApplicationWindow):
             show_downloads_view=lambda: self.navigation_controller.show_view("downloads"),
             get_setting=self.settings.get,
             show_error=self._show_error,
+            show_toast=self._show_toast,
         )
         self.download_manager.set_download_dir(self.download_dir)
         self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
@@ -249,6 +252,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Save settings on window close
         self.connect("close-request", self._on_main_close)
+        # React to stack page changes for MPV controls visibility
+        self.stack.connect("notify::visible-child", self._on_stack_changed)
 
     def _install_shortcuts(self) -> None:
         # Add a "go-back" action with common shortcuts.
@@ -438,6 +443,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self.provider = YTDLPProvider(proxy or None)
             # Update concurrency at runtime
             self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
+            # Update MPV controls visibility preference immediately
+            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
 
         win.connect("close-request", persist)
 
@@ -720,7 +727,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._mpv_proc = proc
             self._mpv_ipc = ipc_path
             self._mpv_speed = 1.0
-            self.ctrl_bar.set_visible(True)
+            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
 
             # Watcher thread: hide controls on exit
             def _watch():
@@ -737,6 +744,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._mpv_proc = None
         self._mpv_ipc = None
         self.ctrl_bar.set_visible(False)
+
+    def _is_mpv_controls_visible(self) -> bool:
+        # Only show controls if MPV running
+        if self._mpv_proc is None:
+            return False
+        # honor autohide preference: show only on player view when enabled
+        if bool(self.settings.get("mpv_autohide_controls")):
+            return (self.stack.get_visible_child_name() == "player")
+        return True
+
+    def _on_stack_changed(self, *_a) -> None:
+        try:
+            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+        except Exception:
+            pass
 
     def _mpv_cookie_arg(self) -> str:
         browser = (self.settings.get("mpv_cookies_browser") or "").strip()
