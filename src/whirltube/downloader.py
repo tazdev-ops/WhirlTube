@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from threading import Event
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ class DownloadTask:
     progress: DownloadProgress = field(default_factory=DownloadProgress)
     _thread: threading.Thread | None = field(default=None, init=False)
     ydl_opts_override: dict | None = None  # allow per-download overrides
+    _cancel: Event = field(default_factory=Event, init=False)
 
     def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
         """Start the download in a background thread using yt-dlp Python API."""
@@ -38,6 +40,9 @@ class DownloadTask:
 
         def hook(d: dict) -> None:
             st = d.get("status")
+            # Cancellation path: raising in hook aborts the download in yt-dlp
+            if self._cancel.is_set():
+                raise KeyboardInterrupt("Cancelled")
             if st == "downloading":
                 self.progress.status = "downloading"
                 self.progress.bytes_downloaded = int(d.get("downloaded_bytes") or 0)
@@ -80,6 +85,16 @@ class DownloadTask:
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
+
+    def stop(self) -> None:
+        """
+        Best-effort cancellation. For Python API we signal via hook and let yt-dlp abort soon.
+        """
+        try:
+            self._cancel.set()
+        except Exception:
+            pass
+        # Thread will exit after yt-dlp aborts; no force-termination here
 
 
 class SubprocessDownloadTask:

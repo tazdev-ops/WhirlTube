@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
+from functools import partial
 
 import gi
 
@@ -19,10 +20,11 @@ from .download_history import add_download
 log = logging.getLogger(__name__)
 
 class DownloadRow(Gtk.Box):
-    def __init__(self, task: Any | None = None, title: str | None = None) -> None:
+    def __init__(self, task: Any | None = None, title: str | None = None, on_cancel: Callable[[], None] | None = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.task = task
         self._base_title = title or getattr(getattr(task, "video", None), "title", "Download")
+        self._on_cancel = on_cancel
 
         self.set_margin_top(6)
         self.set_margin_bottom(6)
@@ -34,6 +36,8 @@ class DownloadRow(Gtk.Box):
 
         # Actions row (open folder/file)
         self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_cancel = Gtk.Button(label="Cancel")
+        self.btn_cancel.connect("clicked", lambda *_: self._on_cancel_clicked())
         self.btn_open_folder = Gtk.Button(label="Open folder")
         self.btn_open_folder.set_sensitive(False)
         self.btn_open_folder.connect("clicked", self._open_folder)
@@ -41,6 +45,7 @@ class DownloadRow(Gtk.Box):
         self.btn_open_file.set_sensitive(False)
         self.btn_open_file.connect("clicked", self._open_file)
 
+        self.actions.append(self.btn_cancel)
         self.actions.append(self.btn_open_folder)
         self.actions.append(self.btn_open_file)
 
@@ -48,6 +53,14 @@ class DownloadRow(Gtk.Box):
         self.append(self.progress)
         self.append(self.status)
         self.append(self.actions)
+
+    def _on_cancel_clicked(self) -> None:
+        try:
+            if self._on_cancel:
+                self._on_cancel()
+        finally:
+            # Disable cancel to avoid repeated presses
+            self.btn_cancel.set_sensitive(False)
 
     def set_queued(self) -> None:
         try:
@@ -84,6 +97,11 @@ class DownloadRow(Gtk.Box):
             self.btn_open_folder.set_sensitive(True)
             if p.filename:
                 self.btn_open_file.set_sensitive(True)
+            # Disable cancel when done
+            self.btn_cancel.set_sensitive(False)
+        elif p.status == "error":
+            # Disable cancel after error
+            self.btn_cancel.set_sensitive(False)
 
     def _open_folder(self, *_a) -> None:
         try:
@@ -104,6 +122,17 @@ class DownloadRow(Gtk.Box):
                     fp = dest / fp
                 if fp.exists():
                     Gio.AppInfo.launch_default_for_uri(f"file://{fp}", None)
+        except Exception:
+            pass
+
+    def mark_cancelled(self) -> None:
+        try:
+            self.label.set_text(f"Cancelled: {self._base_title}")
+            self.status.set_text("Cancelled")
+            self.progress.set_fraction(0.0)
+            self.progress.set_text("")
+            self.btn_cancel.set_sensitive(False)
+            # Keep folder/file buttons disabled
         except Exception:
             pass
 
@@ -167,7 +196,9 @@ class DownloadManager:
         if not self._ensure_download_dir(dest_dir):
             return
         # Create a queued row immediately
-        row = DownloadRow(None, title=video.title)
+        row = DownloadRow(None, title=video.title, on_cancel=partial(self._cancel_row, None))
+        # Store a weak binding to this specific row into the callback
+        row._on_cancel = partial(self._cancel_row, row)  # type: ignore[attr-defined]
         row.set_queued()
         self.downloads_box.append(row)
         self.show_downloads_view()
@@ -180,6 +211,32 @@ class DownloadManager:
         while self._active < self._max_concurrent and self._queue:
             video, opts, dest_dir, row = self._queue.pop(0)
             self._start_task(video, opts, dest_dir, row)
+
+    def _cancel_row(self, row: DownloadRow | None) -> None:
+        # If None passed (shouldn't happen), ignore
+        if row is None:
+            return
+        # If queued: remove from queue
+        for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
+            if r is row:
+                try:
+                    self._queue.pop(i)
+                except Exception:
+                    pass
+                row.mark_cancelled()
+                return
+        # If running: try to stop the task
+        task = getattr(row, "task", None)
+        if task is None:
+            row.mark_cancelled()
+            return
+        try:
+            stop = getattr(task, "stop", None)
+            if callable(stop):
+                stop()
+        except Exception:
+            pass
+        row.mark_cancelled()
 
     def _start_task(self, video: Video, opts: DownloadOptions, dest_dir: Path, row: DownloadRow) -> None:
         self._active += 1
@@ -226,6 +283,8 @@ class DownloadManager:
                 ytdlp_path = None
             task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path)
             row.attach_task(task)
+            # Update cancel binding to running task
+            row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
             task.start(_on_update)
             return
 
@@ -236,5 +295,6 @@ class DownloadManager:
 
         dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
         row.attach_task(dl_task)
+        row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
         dl_task.start(_on_update)
         return

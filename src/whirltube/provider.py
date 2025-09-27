@@ -198,6 +198,25 @@ class YTDLPProvider:
                     log.debug("related fallback search failed: %s", e)
         return out
 
+    # ---------- Metadata helpers ----------
+    def channel_url_of(self, video_url: str) -> str | None:
+        """
+        Return the channel URL for a given video URL if available.
+        """
+        try:
+            info = self._ydl_full.extract_info(video_url, download=False)
+        except Exception:
+            return None
+        if not isinstance(info, dict):
+            return None
+        ch = info.get("channel_url") or info.get("uploader_url")
+        if isinstance(ch, str) and ch.strip():
+            return ch.strip()
+        cid = info.get("channel_id") or info.get("uploader_id")
+        if isinstance(cid, str) and cid.strip() and cid.startswith("UC"):
+            return f"https://www.youtube.com/channel/{cid.strip()}"
+        return None
+
     def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
         """Fetch top-level comments when available via yt-dlp API."""
         opts = dict(_BASE_OPTS, **{"skip_download": True, "getcomments": True})

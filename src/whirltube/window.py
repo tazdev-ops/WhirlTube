@@ -40,7 +40,13 @@ log = logging.getLogger(__name__)
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app, title="WhirlTube")
-        self.set_default_size(1080, 740)
+        # Use persisted window size
+        try:
+            w = int(self.settings.get("win_w") or 1080)
+            h = int(self.settings.get("win_h") or 740)
+        except Exception:
+            w, h = 1080, 740
+        self.set_default_size(w, h)
         self.set_icon_name("whirltube")
 
         self.settings = load_settings()
@@ -57,6 +63,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("mpv_cookies_container", "")
 
         self.settings.setdefault("max_concurrent_downloads", 3)
+        # Window size persistence
+        self.settings.setdefault("win_w", 1080)
+        self.settings.setdefault("win_h", 740)
         # Initialize provider with global proxy and optional Invidious
         proxy = (self.settings.get("http_proxy") or "").strip() or None
         if bool(self.settings.get("use_invidious")):
@@ -423,6 +432,11 @@ class MainWindow(Adw.ApplicationWindow):
         win.connect("close-request", persist)
 
     def _on_main_close(self, *_a) -> bool:
+        # Persist current window size
+        try:
+            self.settings["win_w"], self.settings["win_h"] = int(self.get_width()), int(self.get_height())
+        except Exception:
+            pass
         save_settings(self.settings)
         return False
 
@@ -574,6 +588,7 @@ class MainWindow(Adw.ApplicationWindow):
                 on_follow=self._follow_channel,
                 on_unfollow=self._unfollow_channel,
                 followed=is_followed(v.url) if v.kind == "channel" else False,
+                on_open_channel=self._open_channel_from_video,
             )
             self.results_box.append(row)
 
@@ -636,6 +651,24 @@ class MainWindow(Adw.ApplicationWindow):
             vids = self.provider.comments(video.url, max_comments=100)
             GLib.idle_add(self._populate_results, vids)
 
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_channel_from_video(self, video: Video) -> None:
+        # Resolve channel URL from a video, then open channel view
+        self._show_loading(f"Opening channel for: {video.title}")
+        def worker():
+            try:
+                url = self.provider.channel_url_of(video.url)
+            except Exception:
+                url = None
+            if not url:
+                GLib.idle_add(self._show_error, "Unable to resolve channel for this video.")
+                return
+            # Reuse existing channel opener
+            def go():
+                self._open_channel(url)
+                return False
+            GLib.idle_add(go)
         threading.Thread(target=worker, daemon=True).start()
 
     def _play_video(self, video: Video) -> None:
@@ -829,6 +862,7 @@ class ResultRow(Gtk.Box):
         on_follow: Callable[[Video], None] | None = None,
         on_unfollow: Callable[[Video], None] | None = None,
         followed: bool = False,
+        on_open_channel: Callable[[Video], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.video = video
@@ -837,6 +871,7 @@ class ResultRow(Gtk.Box):
         self.on_open = on_open
         self.on_related = on_related
         self.on_comments = on_comments
+        self.on_open_channel = on_open_channel
         self.thumb_loader_pool = thumb_loader_pool
         self.on_follow = on_follow
         self.on_unfollow = on_unfollow
@@ -873,10 +908,14 @@ class ResultRow(Gtk.Box):
             rel_btn.connect("clicked", lambda *_: self.on_related(self.video))
             cmt_btn = Gtk.Button(label="Comments")
             cmt_btn.connect("clicked", lambda *_: self.on_comments(self.video))
+            ch_btn = Gtk.Button(label="Open channel")
+            ch_btn.set_tooltip_text("Open the uploader's channel")
+            ch_btn.connect("clicked", lambda *_: self.on_open_channel(self.video))
             btn_box.append(play_btn)
             btn_box.append(dl_btn)
             btn_box.append(rel_btn)
             btn_box.append(cmt_btn)
+            btn_box.append(ch_btn)
         else:
             # Non-playable: show Open; if channel, also Follow/Unfollow
             open_btn = Gtk.Button(label="Open")
@@ -889,11 +928,13 @@ class ResultRow(Gtk.Box):
                 def _toggle_follow(_btn):
                     try:
                         if self._followed:
-                            if self.on_unfollow: self.on_unfollow(self.video)
+                            if self.on_unfollow: 
+                                self.on_unfollow(self.video)
                             self._followed = False
                             _btn.set_label("Follow")
                         else:
-                            if self.on_follow: self.on_follow(self.video)
+                            if self.on_follow: 
+                                self.on_follow(self.video)
                             self._followed = True
                             _btn.set_label("Unfollow")
                     except Exception:
@@ -905,8 +946,11 @@ class ResultRow(Gtk.Box):
         open_web.connect("clicked", lambda *_: self._open_in_browser())
         copy_url = Gtk.Button(label="Copy URL")
         copy_url.connect("clicked", lambda *_: self._copy_url())
+        copy_title = Gtk.Button(label="Copy Title")
+        copy_title.connect("clicked", lambda *_: self._copy_title())
         btn_box.append(open_web)
         btn_box.append(copy_url)
+        btn_box.append(copy_title)
         self.append(btn_box)
 
         # Load thumbnail
@@ -989,6 +1033,14 @@ class ResultRow(Gtk.Box):
             disp = Gdk.Display.get_default()
             if disp and self.video and self.video.url:
                 disp.get_clipboard().set_text(self.video.url)
+        except Exception:
+            pass
+
+    def _copy_title(self) -> None:
+        try:
+            disp = Gdk.Display.get_default()
+            if disp and self.video and self.video.title:
+                disp.get_clipboard().set_text(self.video.title)
         except Exception:
             pass
 

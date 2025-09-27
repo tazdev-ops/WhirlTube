@@ -217,3 +217,6 @@ class InvidiousProvider:
 
     def fetch_formats(self, url: str) -> list[tuple[str, str]]:
         return self._fallback.fetch_formats(url)
+
+    def channel_url_of(self, video_url: str) -> str | None:
+        return self._fallback.channel_url_of(video_url)
