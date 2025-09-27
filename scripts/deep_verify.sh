@@ -32,6 +32,7 @@ modules = [
   "whirltube.window",
   "whirltube.dialogs",
   "whirltube.provider",
+  "whirltube.invidious_provider",
   "whirltube.downloader",
   "whirltube.download_manager",
   "whirltube.navigation_controller",
@@ -42,6 +43,8 @@ modules = [
   "whirltube.player",
   "whirltube.mpv_embed",
   "whirltube.history",
+  "whirltube.download_history",
+  "whirltube.subscriptions",
 ]
 out = {}
 errs = 0
@@ -99,4 +102,3 @@ if [ "$PYPROJECT_VER" != "$INIT_VER" ]; then
 else
   echo "VERSION: ok ($PYPROJECT_VER)"
 fi
-SH

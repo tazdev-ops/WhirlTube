@@ -1,0 +1,3667 @@
+
+--- FILE: pyproject.toml ---
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whirltube"
+version = "0.4.2"
+description = "WhirlTube: lightweight GTK4 frontend for YouTube using mpv and yt-dlp"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "WhirlTube contributors" }]
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27",
+  "yt-dlp>=2024.8.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.9",
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "pytest-cov>=5.0",
+]
+embed = [
+  "python-mpv>=1.0.6",
+]
+
+[project.scripts]
+whirltube = "whirltube.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whirltube"]
+include = [
+  "src/whirltube/assets/**",
+  "data/**",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/**",
+  "README.md",
+  "LICENSE",
+  "pyproject.toml",
+  "mypy.ini",
+  "ruff.toml",
+  "tests/**",
+  "data/**",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+lint.select = ["E","F","W","I","UP","B","SIM","C90"]
+lint.ignore = ["E203","E501"]
+src = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+--- FILE: ruff.toml ---
+# Ruff config is in pyproject.toml; this file exists for sdist completeness.
+
+--- FILE: mypy.ini ---
+[mypy]
+python_version = 3.12
+warn_unused_ignores = True
+exclude = (?x)(
+    ^tests/  # ignore tests
+)
+
+[mypy-gi.*]
+ignore_missing_imports = True
+
+[mypy-GdkPixbuf.*]
+ignore_missing_imports = True
+
+[mypy-mpv.*]
+ignore_missing_imports = True
+
+--- FILE: .editorconfig ---
+root = true
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+--- FILE: .gitignore ---
+snapshot.txt
+digest/
+.tripwire/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.tar.gz
+.venv/
+venv/
+*.bak
+# Ignore editor/backup files
+*.bak
+
+--- FILE: .pre-commit-config.yaml ---
+repos:
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: []
+--- FILE: src/whirltube/__main__.py ---
+from __future__ import annotations
+
+from .app import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+--- FILE: src/whirltube/app.py ---
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Adw, Gdk, Gio, Gtk
+
+from .window import MainWindow
+
+APP_ID = "org.whirltube.WhirlTube"
+log = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    level = logging.DEBUG if os.environ.get("WHIRLTUBE_DEBUG") else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+def _register_icon_theme_path() -> None:
+    # Add bundled icons to the icon theme so "whirltube" resolves even from wheels.
+    try:
+        base = Path(__file__).resolve().parent  # src/whirltube
+        icon_root = base / "assets" / "icons" / "hicolor"
+        if icon_root.exists():
+            display = Gdk.Display.get_default()
+            if display is not None:
+                theme = Gtk.IconTheme.get_for_display(display)
+                theme.add_search_path(str(icon_root))
+                log.debug("Registered icon theme path: %s", icon_root)
+    except Exception as e:
+        log.debug("Icon theme path registration skipped: %s", e)
+
+
+class App(Adw.Application):
+    def __init__(self) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self._create_actions()
+
+    def do_activate(self) -> None:  # type: ignore[override]
+        _register_icon_theme_path()
+        win = self.props.active_window
+        if not win:
+            win = MainWindow(app=self)
+        win.present()
+
+    def _create_actions(self) -> None:
+        action_quit = Gio.SimpleAction.new("quit", None)
+        action_quit.connect("activate", self._on_quit)
+        self.add_action(action_quit)
+        self.set_accels_for_action("app.quit", ["<Primary>q"])
+
+    def _on_quit(self, *args) -> None:
+        self.quit()
+
+
+def main(argv: list[str] | None = None) -> int:
+    _setup_logging()
+    Adw.init()
+    app = App()
+    return app.run(argv or sys.argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+--- FILE: src/whirltube/dialogs.py ---
+from __future__ import annotations
+
+import shlex
+from dataclasses import dataclass
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, Gtk
+
+
+@dataclass(slots=True)
+class DownloadOptions:
+    # quality
+    quality_mode: str = "highest"  # highest | lowest | custom
+    custom_format: str | None = None
+    sort_string: str = ""  # yt-dlp -S format-sort string
+
+    # subtitles
+    write_subs: bool = False
+    subs_langs: str = ""  # e.g. "en,es"
+    write_auto_subs: bool = False
+    subs_format: str = "vtt"  # vtt/srt/best
+
+    # sponsorblock
+    sb_mark: str = ""  # e.g. "sponsor,intro"
+    sb_remove: str = ""  # e.g. "selfpromo"
+
+    # embedding/thumbnail
+    embed_metadata: bool = False
+    embed_thumbnail: bool = False
+    write_thumbnail: bool = False
+
+    # cookies
+    use_cookies: bool = False
+    cookies_browser: str = ""  # firefox/chromium/brave/edge/...
+    cookies_keyring: str = ""  # gnomekeyring/kwallet...
+    cookies_profile: str = ""  # profile name/path
+    cookies_container: str = ""  # firefox container name
+
+    # network
+    limit_rate: str = ""  # e.g. "4M"
+    concurrent_fragments: int = 0  # yt-dlp -N
+    impersonate: str = ""  # e.g. "chrome-110"
+
+    # misc
+    extra_flags: str = ""  # raw yt-dlp flags (forces subprocess)
+    target_dir: Path | None = None
+
+    def to_ydl_opts(self) -> dict:
+        """Options mapping for Python API path (limited set)."""
+        opts: dict = {
+            "quiet": True,
+            "nocheckcertificate": True,
+            "merge_output_format": "mp4",
+        }
+
+        # quality
+        if self.quality_mode == "highest":
+            opts["format"] = "bv*+ba/b"
+        elif self.quality_mode == "lowest":
+            opts["format"] = "worst"
+        elif self.quality_mode == "custom" and self.custom_format:
+            opts["format"] = self.custom_format
+
+        # format sort
+        if self.sort_string.strip():
+            opts["format_sort"] = self.sort_string.strip()
+
+        # subtitles
+        if self.write_subs:
+            opts["writesubtitles"] = True
+            if self.subs_langs.strip():
+                langs = [s.strip() for s in self.subs_langs.split(",") if s.strip()]
+                if langs:
+                    opts["subtitleslangs"] = langs
+            if self.write_auto_subs:
+                opts["writeautomaticsub"] = True
+            if self.subs_format:
+                opts["subtitlesformat"] = self.subs_format
+
+        # Note: many advanced flags are easier via CLI; see raw_cli_list().
+        return opts
+
+    def raw_cli_list(self) -> list[str]:
+        """Build yt-dlp CLI args equivalent to all selected options."""
+        parts: list[str] = []
+
+        # quality
+        if self.quality_mode == "highest":
+            parts += ["-f", "bv*+ba/b"]
+        elif self.quality_mode == "lowest":
+            parts += ["-f", "worst"]
+        elif self.quality_mode == "custom" and self.custom_format:
+            parts += ["-f", self.custom_format]
+
+        # format sort
+        if self.sort_string.strip():
+            parts += ["-S", self.sort_string.strip()]
+
+        # subtitles
+        if self.write_subs:
+            parts += ["--write-subs"]
+        if self.write_auto_subs:
+            parts += ["--write-auto-subs"]
+        if self.subs_langs.strip():
+            parts += ["--sub-langs", self.subs_langs.strip()]
+        if self.subs_format.strip():
+            parts += ["--sub-format", self.subs_format.strip()]
+
+        # sponsorblock
+        if self.sb_mark.strip():
+            parts += ["--sponsorblock-mark", self.sb_mark.strip()]
+        if self.sb_remove.strip():
+            parts += ["--sponsorblock-remove", self.sb_remove.strip()]
+
+        # embedding / thumbnail
+        if self.embed_metadata:
+            parts += ["--embed-metadata"]
+        if self.embed_thumbnail:
+            parts += ["--embed-thumbnail"]
+        if self.write_thumbnail:
+            parts += ["--write-thumbnail"]
+
+        # cookies
+        if self.use_cookies and self.cookies_browser.strip():
+            c = self.cookies_browser.strip()
+            if self.cookies_keyring.strip():
+                c += f"+{self.cookies_keyring.strip()}"
+            if self.cookies_profile.strip() or self.cookies_container.strip():
+                prof = self.cookies_profile.strip()
+                cont = self.cookies_container.strip()
+                c += f":{prof}"
+                c += f"::{cont}" if cont else ""
+            parts += ["--cookies-from-browser", c]
+
+        # network
+        if self.limit_rate.strip():
+            parts += ["--limit-rate", self.limit_rate.strip()]
+        if self.concurrent_fragments > 0:
+            parts += ["-N", str(self.concurrent_fragments)]
+        if self.impersonate.strip():
+            parts += ["--impersonate", self.impersonate.strip()]
+
+        # extra
+        if self.extra_flags.strip():
+            parts += shlex.split(self.extra_flags.strip())
+        return parts
+
+
+class DownloadOptionsWindow(Adw.Window):
+    def __init__(self, parent: Gtk.Window, title: str) -> None:
+        super().__init__(transient_for=parent, modal=True, title=f"Download: {title}")
+        self.set_default_size(600, 700)
+
+        root = Adw.ToolbarView()
+        self.set_child(root)
+        header = Adw.HeaderBar()
+        root.add_top_bar(header)
+
+        # Main box
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        
+        # Quality tab
+        quality_group = Adw.PreferencesGroup(title="Quality")
+        main_box.append(quality_group)
+        
+        # Quality mode
+        self.quality_mode = Adw.ComboRow(
+            title="Quality",
+            model=Gtk.StringList.new(["Highest", "Lowest", "Custom"]),
+        )
+        self.quality_mode.set_selected(0)
+        quality_group.add(self.quality_mode)
+        
+        # Custom format (when quality=custom)
+        self.custom_format_row = Adw.EntryRow(title="Custom format")
+        self.custom_format_row.set_visible(False)
+        quality_group.add(self.custom_format_row)
+        
+        # Sort string
+        self.sort_string_row = Adw.EntryRow(title="Format sort string (e.g. res:1080,res)")
+        quality_group.add(self.sort_string_row)
+        
+        # Subtitles group
+        subs_group = Adw.PreferencesGroup(title="Subtitles")
+        main_box.append(subs_group)
+        
+        self.write_subs = Adw.SwitchRow(title="Download subtitles")
+        subs_group.add(self.write_subs)
+        
+        self.subs_langs = Adw.EntryRow(title="Subtitle languages (comma-separated)")
+        self.subs_langs.set_text("en")
+        subs_group.add(self.subs_langs)
+        
+        self.write_auto_subs = Adw.SwitchRow(title="Download auto-generated subtitles")
+        subs_group.add(self.write_auto_subs)
+        
+        self.subs_format_row = Adw.ComboRow(
+            title="Subtitle format",
+            model=Gtk.StringList.new(["vtt", "srt", "best"]),
+        )
+        self.subs_format_row.set_selected(0)
+        subs_group.add(self.subs_format_row)
+        
+        # Sponsorblock group
+        sb_group = Adw.PreferencesGroup(title="SponsorBlock")
+        main_box.append(sb_group)
+        
+        self.sb_mark_row = Adw.EntryRow(title="Categories to mark (comma-separated)")
+        sb_group.add(self.sb_mark_row)
+        
+        self.sb_remove_row = Adw.EntryRow(title="Categories to remove (comma-separated)")
+        sb_group.add(self.sb_remove_row)
+        
+        # Embedding group
+        embed_group = Adw.PreferencesGroup(title="Embedding")
+        main_box.append(embed_group)
+        
+        self.embed_metadata = Adw.SwitchRow(title="Embed metadata")
+        embed_group.add(self.embed_metadata)
+        
+        self.embed_thumbnail = Adw.SwitchRow(title="Embed thumbnail")
+        embed_group.add(self.embed_thumbnail)
+        
+        self.write_thumbnail = Adw.SwitchRow(title="Save thumbnail as separate file")
+        embed_group.add(self.write_thumbnail)
+        
+        # Cookies group
+        cookies_group = Adw.PreferencesGroup(title="Cookies")
+        main_box.append(cookies_group)
+        
+        self.use_cookies = Adw.SwitchRow(title="Use cookies")
+        cookies_group.add(self.use_cookies)
+        
+        self.cookies_browser = Adw.ComboRow(
+            title="Browser",
+            model=Gtk.StringList.new(["firefox", "chromium", "brave", "edge"]),
+        )
+        self.cookies_browser.set_selected(0)
+        cookies_group.add(self.cookies_browser)
+        
+        self.cookies_keyring = Adw.EntryRow(title="Keyring (optional)")
+        cookies_group.add(self.cookies_keyring)
+        
+        self.cookies_profile = Adw.EntryRow(title="Profile (optional)")
+        cookies_group.add(self.cookies_profile)
+        
+        self.cookies_container = Adw.EntryRow(title="Container (Firefox; optional)")
+        cookies_group.add(self.cookies_container)
+        
+        # Network group
+        net_group = Adw.PreferencesGroup(title="Network")
+        main_box.append(net_group)
+        
+        self.limit_rate = Adw.EntryRow(title="Rate limit (e.g. 1M, 100K)")
+        net_group.add(self.limit_rate)
+        
+        self.concurrent_fragments = Adw.SpinRow.new_with_range(0, 16, 1)
+        self.concurrent_fragments.set_title("Concurrent fragments")
+        self.concurrent_fragments.set_value(0)
+        net_group.add(self.concurrent_fragments)
+        
+        self.impersonate = Adw.EntryRow(title="Impersonate browser (e.g. chrome-110)")
+        net_group.add(self.impersonate)
+        
+        # Advanced flags
+        flag_group = Adw.PreferencesGroup(title="Advanced")
+        main_box.append(flag_group)
+        
+        self.extra_flags = Adw.EntryRow(title="Extra yt-dlp flags")
+        flag_group.add(self.extra_flags)
+        
+        # Format selection (with fetch button)
+        format_group = Adw.PreferencesGroup(title="Formats")
+        main_box.append(format_group)
+        
+        format_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.format_combo = Gtk.DropDown.new_from_strings(["Select a format..."])
+        format_row.append(self.format_combo)
+        self.btn_fetch = Gtk.Button(label="Fetch formats")
+        format_row.append(self.btn_fetch)
+        format_action = Adw.ActionRow()
+        format_action.set_title("Available formats")
+        format_action.set_child(format_row)
+        format_group.add(format_action)
+        
+        # When user selects a specific format, force Quality to "Custom" for clarity
+        self.format_combo.connect("notify::selected", self._on_format_selected)
+        
+        # Target directory
+        dir_group = Adw.PreferencesGroup(title="Destination")
+        main_box.append(dir_group)
+        
+        self.target_dir = Adw.EntryRow(title="Download directory")
+        self.target_dir.set_text(str(Path.home() / "Downloads"))
+        dir_group.add(self.target_dir)
+        
+        # Connect quality mode change to show/hide custom format
+        self.quality_mode.connect("notify::selected", self._on_quality_mode_changed)
+        
+        # Buttons
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_cancel = Gtk.Button(label="Cancel")
+        btn_cancel.connect("clicked", lambda *_: self.destroy())
+        btn_download = Gtk.Button(label="Download", css_classes=["suggested-action"])
+        btn_download.connect("clicked", self._on_download)
+        btns.append(btn_cancel)
+        btns.append(btn_download)
+        main_box.append(btns)
+        
+        root.set_content(main_box)
+        
+        # Internal state
+        self._accepted = False
+        self._selected_format_id = None
+        self._format_map: dict[str, str] = {}
+
+    def _on_quality_mode_changed(self, combo: Adw.ComboRow, _pspec) -> None:
+        is_custom = combo.get_selected() == 2  # "Custom" option
+        self.custom_format_row.set_visible(is_custom)
+
+    def _on_format_selected(self, drop: Gtk.DropDown, _pspec) -> None:
+        if drop.get_selected() > 0:
+            # Switch UI to "Custom" and reveal the custom format row for transparency
+            self.quality_mode.set_selected(2)
+            self.custom_format_row.set_visible(True)
+
+    def _on_download(self, _btn) -> None:
+        self._accepted = True
+        self.destroy()
+
+    def get_options(self) -> tuple[bool, DownloadOptions]:
+        """Returns (accepted, options)"""
+        if not self._accepted:
+            return False, DownloadOptions()
+        
+        # Get the selected format if available
+        format_idx = self.format_combo.get_selected()
+        format_id: str | None = None
+        if format_idx > 0:  # Skip the "Select a format..." option
+            model = self.format_combo.get_model()
+            selected_str: str | None = None
+            try:
+                if isinstance(model, Gtk.StringList):
+                    # Gtk.StringList.get_string is the robust way to get the string
+                    selected_str = model.get_string(format_idx)
+            except Exception:
+                selected_str = None
+            if selected_str:
+                format_id = self._format_map.get(selected_str)
+        
+        # Get custom format or selected format
+        custom_format = self.custom_format_row.get_text().strip() if self.custom_format_row.get_visible() else None
+        if not custom_format and format_id:
+            custom_format = str(format_id)
+        # If a specific format was chosen from the list, treat it as "Custom" quality
+        quality_idx = int(self.quality_mode.get_selected())
+        if format_id and quality_idx != 2:
+            quality_idx = 2
+        
+        # Target dir
+        td = self.target_dir.get_text().strip()
+        target_dir = Path(td) if td else None
+
+        opts = DownloadOptions(
+            quality_mode=["highest", "lowest", "custom"][quality_idx],
+            custom_format=custom_format,
+            sort_string=self.sort_string_row.get_text().strip(),
+            write_subs=self.write_subs.get_active(),
+            subs_langs=self.subs_langs.get_text().strip(),
+            write_auto_subs=self.write_auto_subs.get_active(),
+            subs_format=["vtt", "srt", "best"][int(self.subs_format_row.get_selected())],
+            sb_mark=self.sb_mark_row.get_text().strip(),
+            sb_remove=self.sb_remove_row.get_text().strip(),
+            embed_metadata=self.embed_metadata.get_active(),
+            embed_thumbnail=self.embed_thumbnail.get_active(),
+            write_thumbnail=self.write_thumbnail.get_active(),
+            use_cookies=self.use_cookies.get_active(),
+            cookies_browser=["firefox", "chromium", "brave", "edge"][int(self.cookies_browser.get_selected())],
+            cookies_keyring=self.cookies_keyring.get_text().strip(),
+            cookies_profile=self.cookies_profile.get_text().strip(),
+            cookies_container=self.cookies_container.get_text().strip(),
+            limit_rate=self.limit_rate.get_text().strip(),
+            concurrent_fragments=int(self.concurrent_fragments.get_value()),
+            impersonate=self.impersonate.get_text().strip(),
+            extra_flags=self.extra_flags.get_text().strip(),
+            target_dir=target_dir,
+        )
+        return True, opts
+
+    def set_formats(self, formats: list[tuple[str, str]]) -> None:
+        """Update the format dropdown with available formats."""
+        if not formats:
+            return
+        
+        # Create new model with "Select a format..." as first option
+        strings = ["Select a format..."] + [f"{fmt_id}: {fmt_label}" for fmt_id, fmt_label in formats]
+        model = Gtk.StringList.new(strings)
+        self.format_combo.set_model(model)
+        
+        # Store the mapping
+        self._format_map = {f"{fmt_id}: {fmt_label}": fmt_id for fmt_id, fmt_label in formats}
+
+class PreferencesWindow(Adw.PreferencesWindow):
+    def __init__(self, parent: Gtk.Window, settings: dict) -> None:
+        super().__init__(transient_for=parent, modal=True, title="Preferences")
+        self.settings = settings
+        self.set_search_enabled(False)
+
+        # Playback page
+        page_play = Adw.PreferencesPage(title="Playback")
+        group_play = Adw.PreferencesGroup(title="Player")
+        page_play.add(group_play)
+
+        # Playback mode
+        self.playback_mode = Adw.ComboRow(
+            title="Default playback mode",
+            model=Gtk.StringList.new(["External MPV", "In-window (X11 only)"]),
+        )
+        mode_val = settings.get("playback_mode", "external")
+        self.playback_mode.set_selected(0 if mode_val == "external" else 1)
+        group_play.add(self.playback_mode)
+
+        # Playback quality
+        self.playback_quality = Adw.ComboRow(
+            title="Preferred playback quality",
+            model=Gtk.StringList.new(["Auto (best)", "2160p", "1440p", "1080p", "720p", "480p"]),
+        )
+        quality_val = settings.get("mpv_quality", "auto")
+        quality_idx = {"auto": 0, "2160": 1, "1440": 2, "1080": 3, "720": 4, "480": 5}.get(
+            quality_val, 0
+        )
+        self.playback_quality.set_selected(quality_idx)
+        group_play.add(self.playback_quality)
+
+        # Extra MPV args
+        self.mpv_args = Adw.EntryRow(title="MPV extra args")
+        self.mpv_args.set_text(settings.get("mpv_args", ""))
+        group_play.add(self.mpv_args)
+
+        # Cookies group for MPV
+        cookies_group = Adw.PreferencesGroup(title="MPV cookies (optional)")
+        page_play.add(cookies_group)
+
+        self.cookies_enable = Adw.SwitchRow(title="Pass browser cookies to MPV")
+        self.cookies_enable.set_active(bool(settings.get("mpv_cookies_enable", False)))
+        cookies_group.add(self.cookies_enable)
+
+        self.cmb_browser = Adw.ComboRow(
+            title="Browser",
+            model=Gtk.StringList.new(["", "firefox", "chromium", "brave", "edge"]),
+        )
+        browser = (settings.get("mpv_cookies_browser") or "").strip()
+        try:
+            self.cmb_browser.set_selected(["", "firefox", "chromium", "brave", "edge"].index(browser))
+        except ValueError:
+            self.cmb_browser.set_selected(0)
+        cookies_group.add(self.cmb_browser)
+
+        self.entry_keyring = Adw.EntryRow(title="Keyring (optional)")
+        self.entry_keyring.set_text(settings.get("mpv_cookies_keyring", ""))
+        cookies_group.add(self.entry_keyring)
+
+        self.entry_profile = Adw.EntryRow(title="Profile (optional)")
+        self.entry_profile.set_text(settings.get("mpv_cookies_profile", ""))
+        cookies_group.add(self.entry_profile)
+
+        self.entry_container = Adw.EntryRow(title="Container (Firefox; optional)")
+        self.entry_container.set_text(settings.get("mpv_cookies_container", ""))
+        cookies_group.add(self.entry_container)
+
+        # Downloads page
+        page_dl = Adw.PreferencesPage(title="Downloads")
+        group_dl = Adw.PreferencesGroup(title="Location")
+        page_dl.add(group_dl)
+
+        self.download_button = Adw.ActionRow(title="Download directory")
+        self._download_dir_label = Gtk.Label(label=settings.get("download_dir", ""), xalign=1.0)
+        self.download_button.add_suffix(self._download_dir_label)
+        self.download_button.set_activatable(True)
+        self.download_button.connect("activated", self._choose_dir)
+        group_dl.add(self.download_button)
+
+        # Network (global)
+        group_net = Adw.PreferencesGroup(title="Network")
+        page_dl.add(group_net)
+        self.entry_proxy = Adw.EntryRow(title="HTTP(S) proxy (optional)")
+        self.entry_proxy.set_text(settings.get("http_proxy", ""))
+        group_net.add(self.entry_proxy)
+
+        self.add(page_play)
+        self.add(page_dl)
+
+        self.connect("close-request", self._on_close)
+
+    def _choose_dir(self, *_a) -> None:
+        dlg = Gtk.FileDialog(title="Choose download folder")
+        dlg.set_modal(True)
+        dlg.select_folder(self, None, self._on_folder_chosen, None)
+
+    def _on_folder_chosen(self, dialog: Gtk.FileDialog, res: Gio.AsyncResult, _data) -> None:
+        try:
+            f = dialog.select_folder_finish(res)
+        except Exception:
+            return
+        path = f.get_path() or ""
+        self._download_dir_label.set_text(path)
+
+    def _on_close(self, *_a) -> bool:
+        sel = self.playback_mode.get_selected()
+        self.settings["playback_mode"] = "external" if sel == 0 else "embedded"
+        self.settings["mpv_args"] = self.mpv_args.get_text()
+        self.settings["download_dir"] = self._download_dir_label.get_text()
+
+        qsel = self.playback_quality.get_selected()
+        qmap = {0: "auto", 1: "2160", 2: "1440", 3: "1080", 4: "720", 5: "480"}
+        self.settings["mpv_quality"] = qmap.get(qsel, "auto")
+
+        self.settings["mpv_cookies_enable"] = self.cookies_enable.get_active()
+        browsers = ["", "firefox", "chromium", "brave", "edge"]
+        bsel = self.cmb_browser.get_selected()
+        self.settings["mpv_cookies_browser"] = browsers[bsel] if 0 <= bsel < len(browsers) else ""
+        self.settings["mpv_cookies_keyring"] = self.entry_keyring.get_text()
+        self.settings["mpv_cookies_profile"] = self.entry_profile.get_text()
+        self.settings["mpv_cookies_container"] = self.entry_container.get_text()
+        # Global proxy
+        self.settings["http_proxy"] = self.entry_proxy.get_text()
+        return False
+--- FILE: src/whirltube/downloader.py ---
+from __future__ import annotations
+
+import subprocess
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from yt_dlp import YoutubeDL
+from .ytdlp_runner import PROGRESS_TPL, parse_line, YtDlpRunner
+
+from .models import Video
+
+
+@dataclass(slots=True)
+class DownloadProgress:
+    bytes_total: int | None = None
+    bytes_downloaded: int = 0
+    speed_bps: float | None = None
+    eta: int | None = None
+    status: str = "queued"  # queued|downloading|finished|error
+    filename: str | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class DownloadTask:
+    video: Video
+    dest_dir: Path
+    progress: DownloadProgress = field(default_factory=DownloadProgress)
+    _thread: threading.Thread | None = field(default=None, init=False)
+    ydl_opts_override: dict | None = None  # allow per-download overrides
+
+    def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
+        """Start the download in a background thread using yt-dlp Python API."""
+        if self._thread and self._thread.is_alive():
+            return
+
+        def hook(d: dict) -> None:
+            st = d.get("status")
+            if st == "downloading":
+                self.progress.status = "downloading"
+                self.progress.bytes_downloaded = int(d.get("downloaded_bytes") or 0)
+                tb = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                self.progress.bytes_total = int(tb) or None
+                sp = d.get("speed")
+                self.progress.speed_bps = float(sp) if sp is not None else None
+                et = d.get("eta")
+                self.progress.eta = int(et) if et is not None else None
+                on_update(self.progress)
+            elif st == "finished":
+                self.progress.status = "finished"
+                self.progress.filename = d.get("filename")
+                on_update(self.progress)
+
+        def run() -> None:
+            self.progress.status = "downloading"
+            on_update(self.progress)
+            outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
+            ydl_opts = {
+                "quiet": True,
+                "outtmpl": outtmpl,
+                "progress_hooks": [hook],
+                "merge_output_format": "mp4",
+                "format": "bv*+ba/b",
+                "nocheckcertificate": True,
+                "retries": 3,
+                "fragment_retries": 2,
+            }
+            if self.ydl_opts_override:
+                ydl_opts.update(self.ydl_opts_override)
+            try:
+                self.dest_dir.mkdir(parents=True, exist_ok=True)
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([self.video.url])
+            except Exception as e:
+                self.progress.status = "error"
+                self.progress.error = str(e)
+                on_update(self.progress)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+
+class SubprocessDownloadTask:
+    """
+    Legacy path: run yt-dlp as a subprocess. Kept for compatibility, not used by UI.
+    Now emits structured JSON lines parsed by parse_line.
+    """
+
+    def __init__(self, video: Video, dest_dir: Path, cli_args: list[str]) -> None:
+        self.video = video
+        self.dest_dir = dest_dir
+        self.cli_args = cli_args
+        self.progress = DownloadProgress(status="queued")
+        self._thread: threading.Thread | None = None
+
+    def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+
+        def run() -> None:
+            self.progress.status = "downloading"
+            on_update(self.progress)
+            self.dest_dir.mkdir(parents=True, exist_ok=True)
+            outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
+            # Use progress-template to emit structured JSON prefixed lines (parsed by parse_line)
+            args = ["yt-dlp", "-o", outtmpl] + self.cli_args + PROGRESS_TPL + ["--no-quiet", self.video.url]
+            try:
+                with subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                ) as proc:
+                    for line in proc.stdout or []:
+                        events = parse_line(line)
+                        if isinstance(events, Exception):
+                            self.progress.status = "error"
+                            self.progress.error = str(events)
+                            on_update(self.progress)
+                            continue
+                        if not events:
+                            continue
+                        for ev in events:
+                            if ev.kind == "downloading":
+                                payload = ev.payload
+                                self.progress.status = "downloading"
+                                self.progress.bytes_downloaded = int(float(payload.get("downloaded_bytes") or 0.0))
+                                tb = payload.get("total_bytes") or payload.get("total_bytes_estimate") or 0
+                                self.progress.bytes_total = int(tb) or None
+                                sp = payload.get("speed")
+                                self.progress.speed_bps = float(sp) if sp not in (None, "NA") else None
+                                et = payload.get("eta")
+                                self.progress.eta = int(float(et)) if et not in (None, "NA") else None
+                                on_update(self.progress)
+                            elif ev.kind in ("end_of_video", "end_of_playlist"):
+                                pass
+                    proc.wait()
+                    if self.progress.status != "error":
+                        self.progress.status = "finished"
+                        on_update(self.progress)
+            except Exception as e:
+                self.progress.status = "error"
+                self.progress.error = str(e)
+                on_update(self.progress)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def _parse_progress(self, line: str, on_update: Callable[[DownloadProgress], None]) -> None:
+        # Unused pather, left for compatibility
+        on_update(self.progress)
+
+
+class RunnerDownloadTask:
+    """
+    Advanced download using YtDlpRunner (shared JSON progress template).
+    Unifies progress handling with Quick Download.
+    """
+    def __init__(self, video: Video, dest_dir: Path, cli_args: list[str], bin_path: str | None = None) -> None:
+        self.video = video
+        self.dest_dir = dest_dir
+        self.cli_args = cli_args
+        self.progress = DownloadProgress(status="queued")
+        self._runner = YtDlpRunner(self._on_progress_line)
+        self._watcher: threading.Thread | None = None
+        self._bin_path = bin_path
+        self._on_update: Callable[[DownloadProgress], None] | None = None
+
+    def start(self, on_update: Callable[[DownloadProgress], None]) -> None:
+        if self._watcher and self._watcher.is_alive():
+            return
+        self._on_update = on_update
+        self.progress.status = "downloading"
+        on_update(self.progress)
+        try:
+            self.dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.progress.status = "error"
+            self.progress.error = str(e)
+            on_update(self.progress)
+            return
+
+        outtmpl = str(self.dest_dir / "%(title)s.%(ext)s")
+        args = ["-o", outtmpl] + self.cli_args + [self.video.url]
+        self._runner.start(args, bin_path=self._bin_path)
+
+        def watch() -> None:
+            # Poll until process exits, then mark finished if no error
+            while self._runner.is_running():
+                threading.Event().wait(0.2)
+            if self.progress.status != "error":
+                self.progress.status = "finished"
+                if self._on_update:
+                    self._on_update(self.progress)
+
+        self._watcher = threading.Thread(target=watch, daemon=True)
+        self._watcher.start()
+
+    def _on_progress_line(self, text: str) -> None:
+        evs = parse_line(text)
+        if isinstance(evs, Exception):
+            self.progress.status = "error"
+            self.progress.error = str(evs)
+            if self._on_update:
+                self._on_update(self.progress)
+            return
+        if not evs:
+            return
+        for ev in evs:
+            if ev.kind == "downloading":
+                payload = ev.payload
+                self.progress.status = "downloading"
+                try:
+                    self.progress.bytes_downloaded = int(float(payload.get("downloaded_bytes") or 0.0))
+                except Exception:
+                    self.progress.bytes_downloaded = 0
+                tb = payload.get("total_bytes") or payload.get("total_bytes_estimate") or 0
+                try:
+                    self.progress.bytes_total = int(float(tb)) or None
+                except Exception:
+                    self.progress.bytes_total = None
+                sp = payload.get("speed")
+                et = payload.get("eta")
+                self.progress.speed_bps = float(sp) if sp not in (None, "NA") else None
+                self.progress.eta = int(float(et)) if et not in (None, "NA") else None
+                if self._on_update:
+                    self._on_update(self.progress)
+            elif ev.kind in ("end_of_video", "end_of_playlist"):
+                # watch() will set finished upon process exit
+                pass
+
+    def stop(self) -> None:
+        try:
+            self._runner.stop()
+        except Exception:
+            pass
+--- FILE: src/whirltube/history.py ---
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+from .models import Video
+from .util import xdg_cache_dir
+
+_CACHE = xdg_cache_dir()
+SEARCH = _CACHE / "search_history.txt"
+WATCH = _CACHE / "watch_history.jsonl"
+
+
+def add_search_term(query: str) -> None:
+    q = query.strip()
+    if not q:
+        return
+    SEARCH.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
+    with SEARCH.open("a", encoding="utf-8") as f:
+        f.write(f"{ts}\t{q}\n")
+
+
+def add_watch(video: Video) -> None:
+    WATCH.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "id": video.id,
+        "title": video.title,
+        "url": video.url,
+        "channel": video.channel,
+        "duration": video.duration,
+        "thumb_url": video.thumb_url,
+        "kind": video.kind,
+        "ts": int(time.time()),
+    }
+    with WATCH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def list_watch(limit: int = 200) -> list[Video]:
+    if not WATCH.exists():
+        return []
+    out: list[Video] = []
+    lines = WATCH.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            it: dict[str, Any] = json.loads(line)
+            out.append(
+                Video(
+                    id=str(it.get("id") or ""),
+                    title=it.get("title") or "",
+                    url=it.get("url") or "",
+                    channel=it.get("channel"),
+                    duration=it.get("duration"),
+                    thumb_url=it.get("thumb_url"),
+                    kind=it.get("kind") or "video",
+                )
+            )
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
+--- FILE: src/whirltube/models.py ---
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class Video:
+    id: str
+    title: str
+    url: str
+    channel: str | None
+    duration: int | None  # seconds
+    thumb_url: str | None
+    kind: str = "video"  # video|playlist|channel|comment
+
+    @property
+    def duration_str(self) -> str:
+        if not self.duration or self.duration <= 0:
+            return ""
+        s = self.duration
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        if h:
+            return f"{h:d}:{m:02d}:{sec:02d}"
+        return f"{m:d}:{sec:02d}"
+
+    @property
+    def is_playable(self) -> bool:
+        return self.kind == "video"
+
+--- FILE: src/whirltube/mpv_embed.py ---
+from __future__ import annotations
+
+import logging
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk
+
+log = logging.getLogger(__name__)
+
+try:
+    gi.require_version("GdkX11", "4.0")
+    from gi.repository import GdkX11  # type: ignore
+except Exception:
+    GdkX11 = None  # type: ignore
+
+try:
+    import mpv  # type: ignore
+except Exception:
+    mpv = None  # type: ignore
+
+
+class MpvWidget(Gtk.Box):
+    """
+    Attempt to embed mpv into a GTK widget on X11.
+    On Wayland (or missing python-mpv), shows a fallback label.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+
+        self._area = Gtk.DrawingArea()
+        self._area.set_hexpand(True)
+        self._area.set_vexpand(True)
+        self.append(self._area)
+
+        self._mpv: mpv.MPV | None = None
+        self._ready = False
+
+        self._fallback = Gtk.Label(
+            label="Embedded playback not available on this backend.\nUsing external MPV instead.",
+            wrap=True,
+            justify=Gtk.Justification.CENTER,
+        )
+        self._fallback.set_visible(False)
+        self.append(self._fallback)
+
+        self._area.connect("realize", self._on_realize)
+        self._area.connect("unrealize", self._on_unrealize)
+
+    def _on_realize(self, *_args) -> None:
+        if mpv is None or GdkX11 is None:
+            self._fallback.set_visible(True)
+            log.info("mpv embedding not available (python-mpv or X11 missing)")
+            return
+        native = self._area.get_native()
+        if native is None:
+            self._fallback.set_visible(True)
+            return
+        surface = native.get_surface()
+        if surface is None or not isinstance(surface, GdkX11.X11Surface):
+            self._fallback.set_visible(True)
+            log.info("Not an X11 surface; cannot embed mpv.")
+            return
+        xid = GdkX11.X11Surface.get_xid(surface)
+        try:
+            self._mpv = mpv.MPV(wid=str(xid), ytdl=True, osc=True)
+            self._ready = True
+            self._fallback.set_visible(False)
+        except Exception as e:
+            log.exception("Failed to create mpv instance: %s", e)
+            self._fallback.set_visible(True)
+
+    def _on_unrealize(self, *_args) -> None:
+        if self._mpv:
+            try:
+                self._mpv.terminate()
+            except Exception:
+                pass
+        self._mpv = None
+        self._ready = False
+
+    def play(self, url: str) -> bool:
+        if self._ready and self._mpv is not None:
+            try:
+                self._mpv.play(url)
+                return True
+            except Exception:
+                log.exception("mpv.play failed")
+                return False
+        return False
+
+--- FILE: src/whirltube/player.py ---
+from __future__ import annotations
+
+import json
+import shlex
+import shutil
+import socket
+import subprocess
+from collections.abc import Sequence
+
+
+def has_mpv() -> bool:
+    return shutil.which("mpv") is not None
+
+
+def start_mpv(
+    url: str,
+    extra_args: str | Sequence[str] | None = None,
+    ipc_server_path: str | None = None,
+) -> subprocess.Popen:
+    """
+    Launch MPV externally to play a URL. Optionally create a JSON IPC server at ipc_server_path.
+    Returns the Popen handle.
+    """
+    if not has_mpv():
+        raise RuntimeError("MPV is not installed or not found in PATH.")
+    args = ["mpv", "--force-window=yes"]
+    if ipc_server_path:
+        args += [f"--input-ipc-server={ipc_server_path}"]
+    if isinstance(extra_args, str) and extra_args.strip():
+        args.extend(shlex.split(extra_args))
+    elif isinstance(extra_args, (list, tuple)):
+        args.extend(extra_args)
+    args.append(url)
+    return subprocess.Popen(args)
+
+
+def play_in_mpv(url: str, extra_args: str | Sequence[str] | None = None) -> subprocess.Popen:
+    """
+    Backward-compatible helper without IPC. Prefer start_mpv() in new code.
+    """
+    return start_mpv(url, extra_args=extra_args, ipc_server_path=None)
+
+
+def mpv_send_cmd(ipc_path: str, command: list) -> dict | None:
+    """
+    Send a JSON IPC command to MPV and return the parsed response, or None on failure.
+
+    Example command lists:
+      ["cycle", "pause"]
+      ["seek", 10, "relative"]
+      ["set_property", "speed", 1.25]
+      ["quit"]
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(ipc_path)
+            payload = json.dumps({"command": command}) + "\n"
+            s.sendall(payload.encode("utf-8", "ignore"))
+            # Attempt to read a reply line (best effort)
+            try:
+                data = s.recv(4096)
+                if data:
+                    return json.loads(data.decode("utf-8", "ignore"))
+            except Exception:
+                return None
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+--- FILE: src/whirltube/provider.py ---
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterable
+
+from yt_dlp import YoutubeDL
+
+from .models import Video
+
+log = logging.getLogger(__name__)
+
+_BASE_OPTS = {
+    "quiet": True,
+    "nocheckcertificate": True,
+    "retries": 3,
+    "fragment_retries": 2,
+}
+
+
+class YTDLPProvider:
+    """YouTube operations via yt-dlp. No API keys required."""
+
+    def __init__(self, proxy: str | None = None) -> None:
+        self._opts_base: dict = dict(_BASE_OPTS)
+        if proxy:
+            self._opts_base["proxy"] = proxy
+        self._reinit()
+
+    def set_proxy(self, proxy: str | None) -> None:
+        # Update base options and reinitialize internal extractors
+        self._opts_base = dict(_BASE_OPTS)
+        if proxy:
+            self._opts_base["proxy"] = proxy
+        self._reinit()
+
+    def _reinit(self) -> None:
+        # Flat for listings
+        self._ydl_flat = YoutubeDL(dict(self._opts_base, **{"skip_download": True, "extract_flat": "in_playlist"}))
+        # Full for details when needed
+        self._ydl_full = YoutubeDL(dict(self._opts_base, **{"skip_download": True}))
+
+    # ---------- Search ----------
+
+    def search(self, query: str, limit: int = 20, order: str | None = None, duration: str | None = None, period: str | None = None) -> list[Video]:
+        """
+        order: None|"relevance"|"date"|"views"
+        duration: None|"short"|"medium"|"long"
+        period: None|"today"|"week"|"month"
+        """
+        query = query.strip()
+        if not query:
+            return []
+        limit = max(1, min(limit, 50))
+        ordv = (order or "").lower().strip()
+        if ordv == "date":
+            spec = f"ytsearchdate{limit}:{query}"
+        else:
+            spec = f"ytsearch{limit}:{query}"
+        log.debug("yt-dlp search: %s (order=%s, duration=%s, period=%s)", spec, order, duration, period)
+        info = self._ydl_flat.extract_info(spec, download=False)
+        entries: list[dict] = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+
+        # Optional sort by views if we didn't use ytsearchdate
+        if ordv == "views":
+            try:
+                entries.sort(key=lambda e: int(e.get("view_count") or 0), reverse=True)
+            except Exception:
+                pass
+
+        # Duration filter
+        dur = (duration or "").lower().strip()
+        if dur in {"short", "medium", "long"}:
+            def _dur_ok(e: dict) -> bool:
+                try:
+                    d = int(e.get("duration") or 0)
+                except Exception:
+                    d = 0
+                if dur == "short":
+                    return d and d < 4 * 60
+                if dur == "medium":
+                    return 4 * 60 <= d <= 20 * 60
+                if dur == "long":
+                    return d and d > 20 * 60
+                return True
+            entries = [e for e in entries if _dur_ok(e)]
+
+        # Period filter (best effort)
+        per = (period or "").lower().strip()
+        if per in {"today", "week", "month"}:
+            now = int(time.time())
+            day = 24 * 3600
+            if per == "today":
+                cutoff = now - day
+            elif per == "week":
+                cutoff = now - 7 * day
+            else:
+                cutoff = now - 30 * day
+            def _ts(e: dict) -> int | None:
+                t = e.get("timestamp")
+                if isinstance(t, (int, float)):
+                    return int(t)
+                ud = e.get("upload_date")  # YYYYMMDD
+                if isinstance(ud, str) and len(ud) == 8 and ud.isdigit():
+                    try:
+                        dt = datetime.datetime.strptime(ud, "%Y%m%d").replace(tzinfo=datetime.timezone.utc)
+                        return int(dt.timestamp())
+                    except Exception:
+                        return None
+                return None
+            ent2 = []
+            for e in entries:
+                ts = _ts(e)
+                if ts is None:
+                    # keep when unknown (avoid over-filtering)
+                    ent2.append(e)
+                elif ts >= cutoff:
+                    ent2.append(e)
+            entries = ent2
+
+        return [_entry_to_video(e) for e in entries]
+
+    # ---------- Browse helpers ----------
+
+    def trending(self) -> list[Video]:
+        """List trending feed."""
+        url = "https://www.youtube.com/feed/trending"
+        log.debug("yt-dlp browse trending: %s", url)
+        try:
+            data = self._ydl_flat.extract_info(url, download=False)
+            entries = data.get("entries") or []
+            return [_entry_to_video(e) for e in entries if isinstance(e, dict)]
+        except Exception as e:
+            log.exception("trending failed: %s", e)
+            return []
+
+    def browse_url(self, url: str) -> list[Video]:
+        """
+        Generic "open URL" listing: video -> single entry; playlist/channel -> flat entries.
+        """
+        url = url.strip()
+        if not url:
+            return []
+        log.debug("browse url: %s", url)
+        try:
+            data = self._ydl_flat.extract_info(url, download=False)
+            entries = data.get("entries")
+            if entries:
+                return [_entry_to_video(e) for e in entries if isinstance(e, dict)]
+            # Single item
+            return [_info_to_video(data)]
+        except Exception as e:
+            log.exception("browse_url failed: %s", e)
+            return []
+
+    def channel_tab(self, chan_url: str, tab: str = "videos") -> list[Video]:
+        """Browse a channel tab: /videos, /streams, /playlists."""
+        tab = tab.strip("/").lower()
+        base = _ensure_channel_root(chan_url)
+        if not base.endswith(f"/{tab}"):
+            url = base.rstrip("/") + f"/{tab}"
+        else:
+            url = base
+        log.debug("channel_tab: %s", url)
+        return self.browse_url(url)
+
+    def playlist(self, playlist_url: str) -> list[Video]:
+        """Browse a playlist entries."""
+        return self.browse_url(playlist_url)
+
+    def related(self, video_url: str) -> list[Video]:
+        """Fetch related/suggested items. Falls back to title-based search if missing."""
+        try:
+            info = self._ydl_full.extract_info(video_url, download=False)
+        except Exception as e:
+            log.exception("related failed: %s", e)
+            return []
+        out: list[Video] = []
+        if isinstance(info, dict):
+            rel = info.get("related") or info.get("related_videos") or []
+            if isinstance(rel, list):
+                for e in rel:
+                    if isinstance(e, dict):
+                        out.append(_entry_to_video(e))
+            if out:
+                return out
+            # Fallback: title search
+            title = (info.get("title") or "").strip()
+            if title:
+                spec = f"ytsearch20:{title}"
+                try:
+                    s = self._ydl_flat.extract_info(spec, download=False)
+                    entries = s.get("entries") or []
+                    out = [_entry_to_video(e) for e in entries if isinstance(e, dict)]
+                    # Filter out the same URL if present
+                    out = [v for v in out if v.url != video_url]
+                except Exception as e:
+                    log.debug("related fallback search failed: %s", e)
+        return out
+
+    def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
+        """Fetch top-level comments when available via yt-dlp API."""
+        opts = dict(_BASE_OPTS, **{"skip_download": True, "getcomments": True})
+        y = YoutubeDL(opts)
+        try:
+            info = y.extract_info(video_url, download=False)
+        except Exception as e:
+            log.exception("comments failed: %s", e)
+            return []
+        comments = info.get("comments") or []
+        out: list[Video] = []
+        for i, c in enumerate(comments):
+            if i >= max_comments:
+                break
+            comment_id = c.get("id") or c.get("comment_id") or ""
+            author = c.get("author") or c.get("uploader") or "Comment"
+            url = f"{video_url}&lc={comment_id}" if comment_id else video_url
+            out.append(
+                Video(
+                    id=str(comment_id),
+                    title=author,
+                    url=url,
+                    channel=author,
+                    duration=None,
+                    thumb_url=None,
+                    kind="comment",
+                )
+            )
+        return out
+
+    def fetch_formats(self, url: str) -> list[tuple[str, str]]:
+        """Return list of (format_id, label) for a given URL."""
+        opts = dict(_BASE_OPTS, **{"skip_download": True, "listformats": False})
+        y = YoutubeDL(opts)
+        info = y.extract_info(url, download=False)
+        fmts = info.get("formats") or []
+        out: list[tuple[str, str]] = []
+        for f in fmts:
+            fid = str(f.get("format_id"))
+            v = f.get("vcodec") or "—"
+            a = f.get("acodec") or "—"
+            h = f.get("height") or "?"
+            w = f.get("width") or "?"
+            res = f"{w}x{h}"
+            br = f.get("tbr") or f.get("abr") or f.get("vbr") or "?"
+            label = f"{res} {v}/{a} @ {br}k"
+            out.append((fid, label))
+        return out
+
+
+def _entry_to_video(e: dict) -> Video:
+    vid = e.get("id") or e.get("url") or ""
+    title = e.get("title") or "(untitled)"
+    webpage = e.get("webpage_url") or e.get("original_url") or e.get("url") or _watch_url(vid)
+    channel = e.get("channel") or e.get("uploader")
+    duration = e.get("duration")
+    thumb = _pick_thumb(e.get("thumbnails"))
+
+    # Kind inference
+    kind = "video"
+    t = e.get("_type")
+    ie = (e.get("ie_key") or "").strip()
+    if t == "playlist" or ie in {"YoutubePlaylist", "YoutubeTab"}:
+        kind = "playlist"
+        webpage = e.get("webpage_url") or webpage
+    elif ie in {"YoutubeChannel"} or e.get("channel_url") or (e.get("playlist_uploader") and not e.get("duration")):
+        kind = "channel"
+        ch = e.get("channel_url") or e.get("uploader_url") or webpage
+        if ch:
+            webpage = _ensure_channel_root(ch) + "/videos"
+    elif t == "url" and "playlist" in (e.get("url") or ""):
+        kind = "playlist"
+
+    return Video(
+        id=str(vid),
+        title=title,
+        url=webpage,
+        channel=channel,
+        duration=int(duration) if duration else None,
+        thumb_url=thumb,
+        kind=kind,
+    )
+
+def _info_to_video(info: dict) -> Video:
+    return _entry_to_video(info)
+
+def _watch_url(vid: str) -> str:
+    return f"https://www.youtube.com/watch?v={vid}" if vid else ""
+
+def _ensure_channel_root(url: str) -> str:
+    """
+    Return a canonical channel root or user/handle root:
+    Works with /channel/UC..., /@handle, /user/..., /c/...
+    """
+    u = (url or "").rstrip("/")
+    for seg in ("/channel/", "/user/", "/c/", "/@"):
+        if seg in u:
+            return u
+    if "/" not in u:
+        return "https://www.youtube.com/channel/" + u
+    return u
+
+def _pick_thumb(thumbs: object) -> str | None:
+    if not isinstance(thumbs, list) or not thumbs:
+        return None
+    best = None
+    best_w = -1
+    for t in thumbs:
+        if not isinstance(t, dict):
+            continue
+        w = t.get("width") or 0
+        url = t.get("url")
+        if url and w > best_w:
+            best = url
+            best_w = w
+    return best
+
+--- FILE: src/whirltube/quickdownload.py ---
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk
+
+from .util import load_settings, save_settings
+from .ytdlp_runner import YtDlpRunner, parse_line
+
+
+def _notify(summary: str) -> None:
+    try:
+        gi.require_version("Notify", "0.7")
+        from gi.repository import Notify
+
+        Notify.init("whirltube")
+        n = Notify.Notification.new(summary)
+        n.show()
+    except Exception:
+        pass
+
+def _eta_fmt(eta: float | None) -> str:
+    e = int(eta or 0)
+    return f"{e//60:02}:{e%60:02}"
+
+def _mb(b: float) -> str:
+    mb = b / (1024**2)
+    if mb > 1024:
+        return f"{mb/1024:.2f}GB"
+    return f"{mb:.2f}MB"
+
+class QuickDownloadWindow(Gtk.Window):
+    def __init__(self, parent: Gtk.Window) -> None:
+        super().__init__(transient_for=parent, modal=True, title="Quick Download")
+        self.set_default_size(820, 560)
+        self.settings = load_settings()
+
+        root = Adw.ToolbarView()
+        self.set_child(root)
+        header = Adw.HeaderBar()
+        root.add_top_bar(header)
+
+        self.tabview = Adw.TabView()
+
+        # Top controls (URLs + progress)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        top.append(Gtk.Label(label="Paste URLs (one per line)", xalign=0.0))
+        self.url_view = Gtk.TextView()
+        self.url_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.url_view.set_size_request(-1, 120)
+        sw = Gtk.ScrolledWindow()
+        sw.set_child(self.url_view)
+        sw.set_vexpand(False)
+        top.append(sw)
+
+        self.msg = Gtk.Label(xalign=0)
+        self.progress = Gtk.ProgressBar()
+        prow = Gtk.Box(spacing=8)
+        prow.append(self.msg)
+        prow.append(Gtk.Label(label="", hexpand=True))
+        prow.append(self.progress)
+        top.append(prow)
+
+        # Video tab
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        vgrid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        vgrid.attach(Gtk.Label(label="Resolution (-S res)", xalign=0), 0, 0, 1, 1)
+        self.dd_res = Gtk.DropDown.new_from_strings(["2160 (4K)", "1440 (2K)", "1080", "720", "480"])
+        self.dd_res.set_selected(2)
+        vgrid.attach(self.dd_res, 1, 0, 1, 1)
+        vgrid.attach(Gtk.Label(label="Remux to", xalign=0), 0, 1, 1, 1)
+        self.dd_vidfmt = Gtk.DropDown.new_from_strings(["mp4", "mkv", "webm"])
+        self.dd_vidfmt.set_selected(0)
+        vgrid.attach(self.dd_vidfmt, 1, 1, 1, 1)
+        vbox.append(vgrid)
+        self.entry_path_video = Gtk.Entry(
+            text=self.settings.get("quick_video_dir", str(Path.home() / "Videos"))
+        )
+        vbox.append(self._common_path_controls(self.entry_path_video))
+        vbox.append(self._controls_row())
+        page_video = self.tabview.append(vbox)
+        page_video.set_title("Video")
+
+        # Audio tab
+        abox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        agrid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        agrid.attach(Gtk.Label(label="Audio format", xalign=0), 0, 0, 1, 1)
+        self.dd_audfmt = Gtk.DropDown.new_from_strings(["mp3", "m4a", "opus", "vorbis", "wav"])
+        self.dd_audfmt.set_selected(0)
+        agrid.attach(self.dd_audfmt, 1, 0, 1, 1)
+        agrid.attach(Gtk.Label(label="Audio quality (0 best .. 10 worst)", xalign=0), 0, 1, 1, 1)
+        self.dd_audq = Gtk.DropDown.new_from_strings(["0 (Best)", "2 (Good)", "4 (Medium)", "6 (Low)"])
+        self.dd_audq.set_selected(1)
+        agrid.attach(self.dd_audq, 1, 1, 1, 1)
+        abox.append(agrid)
+        self.entry_path_audio = Gtk.Entry(
+            text=self.settings.get("quick_audio_dir", str(Path.home() / "Music"))
+        )
+        abox.append(self._common_path_controls(self.entry_path_audio))
+        abox.append(self._controls_row())
+        page_audio = self.tabview.append(abox)
+        page_audio.set_title("Audio")
+
+        # Settings tab
+        sbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+
+        srow = Gtk.Box(spacing=6)
+        srow.append(Gtk.Label(label="SponsorBlock:", xalign=0))
+        self.dd_sb = Gtk.DropDown.new_from_strings(["Disabled", "Mark (default)", "Remove (default)"])
+        self.dd_sb.set_selected(0)
+        srow.append(self.dd_sb)
+        self.chk_playlist = Gtk.CheckButton(label="Playlist mode")
+        srow.append(self.chk_playlist)
+        sbox.append(srow)
+
+        crow = Gtk.Box(spacing=6)
+        crow.append(Gtk.Label(label="Cookies file:", xalign=0))
+        self.entry_cookies = Gtk.Entry()
+        self.entry_cookies.set_text(self.settings.get("quick_cookies_path", "") or "")
+        crow.append(self.entry_cookies)
+        btn_cook = Gtk.Button(label="Browse")
+        btn_cook.connect("clicked", self._on_browse_cookies)
+        crow.append(btn_cook)
+        sbox.append(crow)
+
+        yrow = Gtk.Box(spacing=6)
+        yrow.append(Gtk.Label(label="yt-dlp path:", xalign=0))
+        self.entry_ytdlp = Gtk.Entry()
+        self.entry_ytdlp.set_text(self.settings.get("ytdlp_path", "") or "")
+        yrow.append(self.entry_ytdlp)
+        btn_y = Gtk.Button(label="Browse")
+        btn_y.connect("clicked", self._on_browse_ytdlp)
+        yrow.append(btn_y)
+        sbox.append(yrow)
+
+        page_settings = self.tabview.append(sbox)
+        page_settings.set_title("Settings")
+
+        vcontainer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vcontainer.append(top)
+        vcontainer.append(self.tabview)
+        root.set_content(vcontainer)
+
+        self.runner = YtDlpRunner(self._on_progress_line)
+
+    def _common_path_controls(self, entry: Gtk.Entry) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row = Gtk.Box(spacing=6)
+        btn = Gtk.Button(label="Browse")
+        btn.connect("clicked", lambda *_: self._on_browse_folder(entry))
+        row.append(entry)
+        row.append(btn)
+        box.append(row)
+        return box
+
+    def _controls_row(self) -> Gtk.Widget:
+        row = Gtk.Box(spacing=6)
+        btn_dl = Gtk.Button(label="Download")
+        btn_dl.connect("clicked", self._on_download)
+        btn_stop = Gtk.Button(label="Stop")
+        btn_stop.connect("clicked", self._on_stop)
+        row.append(btn_dl)
+        row.append(btn_stop)
+        return row
+
+    def _on_browse_folder(self, entry: Gtk.Entry, *_):
+        dlg = Gtk.FileDialog(title="Choose folder")
+        dlg.select_folder(self, None, self._on_folder_selected, entry)
+
+    def _on_folder_selected(self, dlg: Gtk.FileDialog, res: Gio.AsyncResult, entry: Gtk.Entry):
+        try:
+            f = dlg.select_folder_finish(res)
+            if f:
+                entry.set_text(f.get_path() or "")
+        except Exception:
+            pass
+
+    def _on_browse_cookies(self, *_):
+        dlg = Gtk.FileDialog(title="Choose cookies file")
+        dlg.open(self, None, self._on_cookies_selected, None)
+
+    def _on_cookies_selected(self, dlg: Gtk.FileDialog, res: Gio.AsyncResult, _data):
+        try:
+            f = dlg.open_finish(res)
+            if f:
+                self.entry_cookies.set_text(f.get_path() or "")
+        except Exception:
+            pass
+
+    def _on_browse_ytdlp(self, *_):
+        dlg = Gtk.FileDialog(title="Choose yt-dlp binary")
+        dlg.open(self, None, self._on_ytdlp_selected, None)
+
+    def _on_ytdlp_selected(self, dlg: Gtk.FileDialog, res: Gio.AsyncResult, _data):
+        try:
+            f = dlg.open_finish(res)
+            if f:
+                self.entry_ytdlp.set_text(f.get_path() or "")
+        except Exception:
+            pass
+
+    def _on_download(self, *_):
+        buf = self.url_view.get_buffer()
+        start = buf.get_start_iter()
+        end = buf.get_end_iter()
+        urls = [u.strip() for u in buf.get_text(start, end, False).splitlines() if u.strip()]
+        if not urls:
+            self._set_msg("No URLs")
+            return
+
+        page = self.tabview.get_selected_page()
+        title = page.get_title()
+        source_entry = self.entry_path_video if title == "Video" else self.entry_path_audio
+
+        out_dir = os.path.expanduser(source_entry.get_text() or "")
+        if not out_dir or not Path(out_dir).exists():
+            self._set_msg("Invalid download folder")
+            return
+
+        # persist per-tab path and ytdlp_path (do not clobber global download_dir)
+        if title == "Video":
+            self.settings["quick_video_dir"] = out_dir
+        else:
+            self.settings["quick_audio_dir"] = out_dir
+
+        self.settings["ytdlp_path"] = self.entry_ytdlp.get_text().strip()
+        # also persist cookies path for convenience
+        self.settings["quick_cookies_path"] = self.entry_cookies.get_text().strip()
+        save_settings(self.settings)
+
+        args: list[str] = []
+        args += ["-P", out_dir]
+        # Global proxy
+        proxy = (self.settings.get("http_proxy") or "").strip()
+        if proxy:
+            args += ["--proxy", proxy]
+
+        if title == "Video":
+            sel = self.dd_res.get_selected()
+            res = ["res:2160", "res:1440", "res:1080", "res:720", "res:480"][sel if sel >= 0 else 2]
+            args += ["-S", res]
+            fmt = ["mp4", "mkv", "webm"][self.dd_vidfmt.get_selected() or 0]
+            args += ["--remux-video", fmt]
+        else:
+            fmt = ["mp3", "m4a", "opus", "vorbis", "wav"][self.dd_audfmt.get_selected() or 0]
+            qual_map = ["0", "2", "4", "6"]
+            aq = qual_map[self.dd_audq.get_selected() or 1]
+            args += ["-x", "--audio-format", fmt, "--audio-quality", aq]
+
+        # cookies file
+        ck = self.entry_cookies.get_text().strip()
+        if ck:
+            args += ["--cookies", ck]
+
+        # sponsorblock
+        sb_idx = self.dd_sb.get_selected()
+        if sb_idx == 1:
+            args += ["--sponsorblock-mark=default"]
+        elif sb_idx == 2:
+            args += ["--sponsorblock-remove=default"]
+
+        # playlist mode
+        if self.chk_playlist.get_active():
+            args += ["--yes-playlist", "-o", "%(playlist)s/%(title)s.%(ext)s"]
+        else:
+            args += [
+                "--break-on-reject",
+                "--match-filter",
+                "!playlist",
+                "--no-playlist",
+                "-o",
+                "%(title)s.%(ext)s",
+            ]
+
+        args += urls
+
+        self.progress.set_fraction(0.0)
+        self._set_msg("Initializing…")
+        path = self.settings.get("ytdlp_path", "") or None
+        self.runner.start(args, bin_path=path)
+
+    def _on_stop(self, *_):
+        self.runner.stop()
+        self.progress.set_fraction(0.0)
+        self._set_msg("Stopped")
+
+    def _on_progress_line(self, text: str) -> None:
+        GLib.idle_add(self._handle_line, text)
+
+    def _handle_line(self, text: str) -> bool:
+        parsed = parse_line(text)
+        if isinstance(parsed, Exception):
+            self._end(error=str(parsed))
+            return False
+        if not parsed:
+            return False
+        for ev in parsed:
+            if ev.kind == "downloading":
+                d = float(ev.payload.get("downloaded_bytes") or 0.0)
+                t = ev.payload.get("total_bytes") or ev.payload.get("total_bytes_estimate")
+                total = float(t or 0.0)
+                frac = (d / total) if total > 0 else 0.0
+                self.progress.set_fraction(min(1.0, max(0.0, frac)))
+                speed = float(ev.payload.get("speed") or 0.0)
+                eta = float(ev.payload.get("eta") or 0.0)
+                pc = ev.payload.get("playlist_count")
+                pi = ev.payload.get("playlist_index")
+                msg = f"{_mb(d)} | {speed/(1024**2):.2f}MB/s | ETA {_eta_fmt(eta)}"
+                if pc and pi:
+                    msg += f" {pi}/{pc}"
+                self._set_msg(msg)
+            elif ev.kind == "end_of_playlist":
+                self._end(ok="Playlist finished")
+            elif ev.kind == "end_of_video":
+                pass
+        return False
+
+    def _end(self, ok: str | None = None, error: str | None = None) -> None:
+        self.runner.stop()
+        if ok:
+            self._set_msg(ok)
+            _notify(ok)
+        elif error:
+            self._set_msg(error)
+            _notify(error)
+
+    def _set_msg(self, s: str) -> None:
+        self.msg.set_label(s)
+
+--- FILE: src/whirltube/util.py ---
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+APP_NAME = "whirltube"
+
+def xdg_config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    p = Path(base) / APP_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def xdg_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    p = Path(base) / APP_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def xdg_data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    p = Path(base) / APP_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def settings_path() -> Path:
+    return xdg_config_dir() / "settings.json"
+
+def load_settings() -> dict[str, Any]:
+    p = settings_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_settings(data: dict[str, Any]) -> None:
+    p = settings_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+--- FILE: src/whirltube/ytdlp_runner.py ---
+from __future__ import annotations
+
+import json
+import subprocess
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from queue import Empty, Queue
+
+PREFIX = "WTJSON:"  # marker for JSON lines we emit
+
+PRINT_HOOKS = [
+    "--print",
+    f'{PREFIX}{{"type": "pre_download"}}',
+    "--print",
+    f'{PREFIX}{{"type": "end_of_playlist"}}',
+    "--print",
+    f'{PREFIX}{{"type": "end_of_video"}}',
+]
+
+PROGRESS_TPL = [
+    "--progress-template",
+    f'{PREFIX}{{"type":"downloading","eta":%(progress.eta)s,'
+    f'"downloaded_bytes":%(progress.downloaded_bytes)s,'
+    f'"total_bytes":%(progress.total_bytes)s,'
+    f'"total_bytes_estimate":%(progress.total_bytes_estimate)s,'
+    f'"elapsed":%(progress.elapsed)s,"speed":%(progress.speed)s,'
+    f'"playlist_count":%(info.playlist_count)s,'
+    f'"playlist_index":%(info.playlist_index)s}}',
+]
+
+
+@dataclass
+class ProgressEvent:
+    kind: str
+    payload: dict
+
+def parse_line(line: str) -> list[ProgressEvent] | Exception | None:
+    if line.startswith("stderr:ERROR: "):
+        return RuntimeError(line[len("stderr:ERROR: ") :].strip())
+    if line.startswith("ERROR: "):
+        return RuntimeError(line[len("ERROR: ") :].strip())
+    idx = line.find(PREFIX)
+    if idx < 0:
+        return None
+    part = line[idx + len(PREFIX) :].strip()
+    try:
+        obj = json.loads(part.replace("NA", "null"))
+        if isinstance(obj, dict) and "type" in obj:
+            return [ProgressEvent(obj["type"], obj)]
+    except Exception:
+        return None
+    return None
+
+class YtDlpRunner:
+    def __init__(self, on_progress: Callable[[str], None]):
+        self._on_progress = on_progress
+        self._proc: subprocess.Popen | None = None
+        self._q: Queue[str] = Queue()
+
+    def is_running(self) -> bool:
+        return self._proc is not None
+
+    def start(self, args: list[str], bin_path: str | None = None) -> bool:
+        self.stop()
+        cmd = [bin_path or "yt-dlp"] + args + PRINT_HOOKS + PROGRESS_TPL + ["--no-quiet"]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        threading.Thread(target=self._pump, daemon=True).start()
+        return True
+
+    def stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def _pump(self) -> None:
+        assert self._proc and self._proc.stdout and self._proc.stderr
+
+        def reader(stream, prefix: str):
+            while True:
+                chunk = stream.readline()
+                if not chunk:
+                    break
+                try:
+                    text = chunk.decode(errors="ignore")
+                except Exception:
+                    continue
+                self._q.put(prefix + text)
+
+        t1 = threading.Thread(target=reader, args=(self._proc.stdout, ""), daemon=True)
+        t2 = threading.Thread(target=reader, args=(self._proc.stderr, "stderr:"), daemon=True)
+        t1.start()
+        t2.start()
+
+        while self._proc:
+            try:
+                line = self._q.get(timeout=0.2)
+            except Empty:
+                continue
+            self._on_progress(line)
+
+        while not self._q.empty():
+            try:
+                line = self._q.get_nowait()
+            except Empty:
+                break
+            self._on_progress(line)
+
+--- FILE: src/whirltube/__init__.py ---
+from __future__ import annotations
+
+__all__ = ["__version__"]
+__version__ = "0.4.2"
+
+--- FILE: src/whirltube/window.py ---
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from pathlib import Path
+
+import gi
+import httpx
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
+
+from . import __version__
+from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
+from .history import add_search_term, add_watch, list_watch
+from .models import Video
+from .mpv_embed import MpvWidget
+from .player import has_mpv, start_mpv, mpv_send_cmd
+from .provider import YTDLPProvider
+from .invidious_provider import InvidiousProvider
+from .download_manager import DownloadManager
+from .navigation_controller import NavigationController
+from .download_history import list_downloads
+from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
+from .quickdownload import QuickDownloadWindow
+from .util import load_settings, save_settings, xdg_data_dir
+
+log = logging.getLogger(__name__)
+
+
+class MainWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(application=app, title="WhirlTube")
+        self.set_default_size(1080, 740)
+        self.set_icon_name("whirltube")
+
+        self.settings = load_settings()
+        self.download_dir = Path(self.settings.get("download_dir") or str(xdg_data_dir() / "downloads"))
+        self.settings.setdefault("playback_mode", "external")  # external | embedded
+        self.settings.setdefault("mpv_args", "")
+        self.settings.setdefault("mpv_quality", "auto")
+
+        # Optional playback cookies for MPV
+        self.settings.setdefault("mpv_cookies_enable", False)
+        self.settings.setdefault("mpv_cookies_browser", "")
+        self.settings.setdefault("mpv_cookies_keyring", "")
+        self.settings.setdefault("mpv_cookies_profile", "")
+        self.settings.setdefault("mpv_cookies_container", "")
+
+        # Initialize provider with global proxy and optional Invidious
+        proxy = (self.settings.get("http_proxy") or "").strip() or None
+        if bool(self.settings.get("use_invidious")):
+            base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
+            self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+        else:
+            self.provider = YTDLPProvider(proxy or None)
+        self._search_generation = 0
+        self._thumb_loader_pool = ThreadPoolExecutor(max_workers=4)
+
+        # ToolbarView
+        self.toolbar_view = Adw.ToolbarView()
+        self.set_content(self.toolbar_view)
+
+        # Header
+        header = Adw.HeaderBar()
+        self.toolbar_view.add_top_bar(header)
+
+        # MPV control bar (hidden by default; shown for external MPV)
+        self.ctrl_bar = Adw.HeaderBar()
+        self.ctrl_bar.set_title_widget(Gtk.Label(label="MPV Controls", css_classes=["dim-label"]))
+        # Buttons: Seek -10, Play/Pause, Seek +10, Speed -, Speed +, Stop
+        self.btn_seek_back = Gtk.Button(icon_name="media-seek-backward-symbolic")
+        self.btn_play_pause = Gtk.Button(icon_name="media-playback-pause-symbolic")
+        self.btn_seek_fwd = Gtk.Button(icon_name="media-seek-forward-symbolic")
+        self.btn_speed_down = Gtk.Button(label="Speed -")
+        self.btn_speed_up = Gtk.Button(label="Speed +")
+        self.btn_stop_mpv = Gtk.Button(icon_name="media-playback-stop-symbolic")
+        self.btn_seek_back.connect("clicked", lambda *_: self._mpv_seek(-10))
+        self.btn_play_pause.connect("clicked", lambda *_: self._mpv_cycle_pause())
+        self.btn_seek_fwd.connect("clicked", lambda *_: self._mpv_seek(10))
+        self.btn_speed_down.connect("clicked", lambda *_: self._mpv_speed_delta(-0.1))
+        self.btn_speed_up.connect("clicked", lambda *_: self._mpv_speed_delta(0.1))
+        self.btn_stop_mpv.connect("clicked", lambda *_: self._mpv_stop())
+        # Pack controls on the right
+        self.ctrl_bar.pack_end(self.btn_stop_mpv)
+        self.ctrl_bar.pack_end(self.btn_speed_up)
+        self.ctrl_bar.pack_end(self.btn_speed_down)
+        self.ctrl_bar.pack_end(self.btn_seek_fwd)
+        self.ctrl_bar.pack_end(self.btn_play_pause)
+        self.ctrl_bar.pack_end(self.btn_seek_back)
+        self.toolbar_view.add_top_bar(self.ctrl_bar)
+        self.ctrl_bar.set_visible(False)
+
+        # Back button (NavigationController will connect it)
+        self.btn_back = Gtk.Button(icon_name="go-previous-symbolic")
+        self.btn_back.set_tooltip_text("Back")
+        header.pack_start(self.btn_back)
+
+        # Menu
+        menu = Gio.Menu()
+        menu.append("Preferences", "win.preferences")
+        menu.append("About", "win.about")
+        menu.append("Manage Subscriptions", "win.subscriptions")
+        menu.append("Import Subscriptions…", "win.subs_import")
+        menu.append("Export Subscriptions…", "win.subs_export")
+        menu.append("Keyboard Shortcuts", "win.shortcuts")
+        menu.append("Download History", "win.download_history")
+        menu.append("Quit", "app.quit")
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_btn.set_menu_model(menu)
+        header.pack_start(menu_btn)
+
+        # Quick actions (left)
+        self.btn_open = Gtk.Button(label="Open URL…")
+        self.btn_open.set_tooltip_text("Open any YouTube URL (video/playlist/channel)")
+        self.btn_open.connect("clicked", self._on_open_url)
+        header.pack_start(self.btn_open)
+
+        self.btn_hist = Gtk.Button(label="History")
+        self.btn_hist.set_tooltip_text("Watch history")
+        self.btn_hist.connect("clicked", self._on_history)
+        header.pack_start(self.btn_hist)
+
+        self.btn_feed = Gtk.Button(label="Feed")
+        self.btn_feed.set_tooltip_text("Recent from followed channels")
+        self.btn_feed.connect("clicked", self._on_feed)
+        header.pack_start(self.btn_feed)
+
+        self.btn_qdl = Gtk.Button(label="Quick Download")
+        self.btn_qdl.set_tooltip_text("Batch download multiple URLs")
+        self.btn_qdl.connect("clicked", self._on_quick_download)
+        header.pack_start(self.btn_qdl)
+
+        # Search
+        self.search = Gtk.SearchEntry(hexpand=True)
+        self.search.set_placeholder_text("Search YouTube…")
+        header.set_title_widget(self.search)
+        self.search.connect("activate", self._on_search_activate)
+
+        # Filters popover
+        self.btn_filters = Gtk.MenuButton(icon_name="view-list-symbolic")
+        self.btn_filters.set_tooltip_text("Search filters")
+        header.pack_end(self.btn_filters)
+        self._filters_pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        # Duration
+        box.append(Gtk.Label(label="Duration", xalign=0.0))
+        self.dd_dur = Gtk.DropDown.new_from_strings(["Any", "Short (<4m)", "Medium (4–20m)", "Long (>20m)"])
+        box.append(self.dd_dur)
+        # Upload date
+        box.append(Gtk.Label(label="Upload date", xalign=0.0))
+        self.dd_period = Gtk.DropDown.new_from_strings(["Any", "Today", "This week", "This month"]) 
+        box.append(self.dd_period)
+        # Order
+        box.append(Gtk.Label(label="Order", xalign=0.0))
+        self.dd_order = Gtk.DropDown.new_from_strings(["Relevance", "Date", "Views"]) 
+        box.append(self.dd_order)
+        # Buttons row
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_clear = Gtk.Button(label="Clear")
+        btn_apply = Gtk.Button(label="Apply", css_classes=["suggested-action"]) 
+        row.append(btn_clear)
+        row.append(btn_apply)
+        box.append(row)
+        self._filters_pop.set_child(box)
+        self.btn_filters.set_popover(self._filters_pop)
+        # Load current settings into UI
+        self._filters_load_from_settings()
+        btn_clear.connect("clicked", self._filters_clear)
+        btn_apply.connect("clicked", self._filters_apply)
+
+        # Downloads toggle
+        self.downloads_button = Gtk.Button(label="Downloads")
+        self.downloads_button.connect("clicked", self._show_downloads)
+        header.pack_end(self.downloads_button)
+
+        # Stack
+        self.stack = Gtk.Stack(
+            vexpand=True,
+            hexpand=True,
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+        )
+
+        # Results
+        self.results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._set_margins(self.results_box, 8)
+        results_scroll = Gtk.ScrolledWindow(vexpand=True)
+        results_scroll.set_child(self.results_box)
+        self.stack.add_titled(results_scroll, "results", "Results")
+
+        # Downloads
+        self.downloads_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._set_margins(self.downloads_box, 8)
+        downloads_scroll = Gtk.ScrolledWindow(vexpand=True)
+        downloads_scroll.set_child(self.downloads_box)
+        self.stack.add_titled(downloads_scroll, "downloads", "Downloads")
+
+        # Player (embedded mpv)
+        self.player_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._set_margins(self.player_box, 0)
+        self.mpv_widget = MpvWidget()
+        self.player_box.append(self.mpv_widget)
+        self.stack.add_titled(self.player_box, "player", "Player")
+
+        self.toolbar_view.set_content(self.stack)
+
+        # Navigation controller (handles back button)
+        self.navigation_controller = NavigationController(self.stack, self.btn_back)
+
+        # Download manager (after downloads_box and nav exist)
+        self.download_manager = DownloadManager(
+            downloads_box=self.downloads_box,
+            show_downloads_view=lambda: self.navigation_controller.show_view("downloads"),
+            get_setting=self.settings.get,
+            show_error=self._show_error,
+        )
+        self.download_manager.set_download_dir(self.download_dir)
+
+        self._create_actions()
+        self._set_welcome()
+        self._install_shortcuts()
+
+        # MPV external player state
+        self._mpv_proc = None
+        self._mpv_ipc = None
+        self._mpv_speed = 1.0
+
+        # Save settings on window close
+        self.connect("close-request", self._on_main_close)
+
+    def _install_shortcuts(self) -> None:
+        # Add a "go-back" action with common shortcuts.
+        go_back = Gio.SimpleAction.new("go-back", None)
+        go_back.connect("activate", lambda *_: self.navigation_controller.go_back())
+        self.add_action(go_back)
+        app = self.get_application()
+        if app:
+            app.set_accels_for_action(
+                "win.go-back",
+                ["Escape", "BackSpace", "<Alt>Left", "<Primary>BackSpace"],
+            )
+
+    def _set_margins(self, w: Gtk.Widget, px: int) -> None:
+        w.set_margin_top(px)
+        w.set_margin_bottom(px)
+        w.set_margin_start(px)
+        w.set_margin_end(px)
+
+    def _create_actions(self) -> None:
+        about = Gio.SimpleAction.new("about", None)
+        about.connect("activate", self._on_about)
+        self.add_action(about)
+
+        prefs = Gio.SimpleAction.new("preferences", None)
+        prefs.connect("activate", self._on_preferences)
+        self.add_action(prefs)
+
+        shortcuts = Gio.SimpleAction.new("shortcuts", None)
+        shortcuts.connect("activate", self._on_shortcuts)
+        self.add_action(shortcuts)
+
+        dlh = Gio.SimpleAction.new("download_history", None)
+        dlh.connect("activate", self._on_download_history)
+        self.add_action(dlh)
+
+    def _show_loading(self, message: str) -> None:
+        # Clear results and show a centered spinner + message
+        self._clear_results()
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_halign(Gtk.Align.CENTER)
+        row.set_valign(Gtk.Align.CENTER)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        row.append(spinner)
+        row.append(Gtk.Label(label=message))
+        self.results_box.append(row)
+        self.navigation_controller.show_view("results")
+
+    def _on_shortcuts(self, *_a) -> None:
+        # Create a ShortcutsWindow describing common keybindings
+        win = Gtk.ShortcutsWindow(transient_for=self, modal=True)
+        sec = Gtk.ShortcutsSection()
+        # Navigation group
+        grp_nav = Gtk.ShortcutsGroup(title="Navigation")
+        grp_nav.append(Gtk.ShortcutsShortcut(title="Back", accelerator="Escape"))
+        grp_nav.append(Gtk.ShortcutsShortcut(title="Back", accelerator="BackSpace"))
+        grp_nav.append(Gtk.ShortcutsShortcut(title="Back", accelerator="<Alt>Left"))
+        grp_nav.append(Gtk.ShortcutsShortcut(title="Back", accelerator="<Primary>BackSpace"))
+        # App group
+        grp_app = Gtk.ShortcutsGroup(title="Application")
+        grp_app.append(Gtk.ShortcutsShortcut(title="Quit", accelerator="<Primary>q"))
+        # Search group
+        grp_search = Gtk.ShortcutsGroup(title="Search")
+        grp_search.append(Gtk.ShortcutsShortcut(title="Run search", accelerator="Return"))
+        # Player/MPV controls (external; via control bar)
+        grp_play = Gtk.ShortcutsGroup(title="MPV Controls (when visible)")
+        grp_play.append(Gtk.ShortcutsShortcut(title="Seek backward 10s", accelerator="button"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Play/Pause", accelerator="button"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Seek forward 10s", accelerator="button"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Speed - / +", accelerator="button"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Stop", accelerator="button"))
+        # Assemble
+        sec.append(grp_nav)
+        sec.append(grp_app)
+        sec.append(grp_search)
+        sec.append(grp_play)
+        win.add(sec)
+        win.present()
+
+    def _on_about(self, *_args) -> None:
+        dlg = Adw.AboutDialog(
+            application_name="WhirlTube",
+            application_icon="whirltube",
+            developer_name="WhirlTube contributors",
+            version=__version__,
+            license_type=Gtk.License.GPL_3_0,
+            website="https://github.com/whirltube/whirltube",
+            issue_url="https://github.com/whirltube/whirltube/issues",
+            comments="Lightweight GTK4 frontend for YouTube using MPV + yt-dlp.",
+        )
+        dlg.present(self)
+
+    def _on_download_history(self, *_a) -> None:
+        vids = list_downloads(limit=300)
+        self._populate_results(vids)
+        self.navigation_controller.show_view("results")
+
+    def _on_subscriptions(self, *_a) -> None:
+        # Show followed channels as rows (channel-kind Video entries)
+        subs = list_subscriptions()
+        vids = []
+        for sub in subs:
+            title = sub.title or "(channel)"
+            vids.append(Video(id=sub.url, title=title, url=sub.url, channel=title, duration=None, thumb_url=None, kind="channel"))
+        self._populate_results(vids)
+        self.navigation_controller.show_view("results")
+
+    def _on_subs_import(self, *_a) -> None:
+        dlg = Gtk.FileDialog(title="Import subscriptions.json")
+        def on_done(d, res, *_):
+            try:
+                f = d.open_finish(res)
+            except Exception:
+                return
+            path = f.get_path()
+            if not path:
+                return
+            try:
+                added = import_subscriptions(Path(path))
+                if added:
+                    # Refresh subscriptions view if currently visible
+                    self._on_subscriptions()
+            except Exception:
+                pass
+        dlg.open(self, None, on_done, None)
+
+    def _on_subs_export(self, *_a) -> None:
+        # Choose a folder, write subscriptions.json into it
+        dlg = Gtk.FileDialog(title="Choose export folder")
+        def on_done(d, res, *_):
+            try:
+                f = d.select_folder_finish(res)
+            except Exception:
+                return
+            path = f.get_path()
+            if not path:
+                return
+            dest = Path(path) / "subscriptions.json"
+            try:
+                export_subscriptions(dest)
+            except Exception:
+                pass
+        dlg.select_folder(self, None, on_done, None)
+
+    def _on_preferences(self, *_a) -> None:
+        win = PreferencesWindow(self, self.settings)
+        win.present()
+
+        def persist(_w, *_a):
+            save_settings(self.settings)
+            new_dir = self.settings.get("download_dir")
+            if new_dir:
+                self.download_dir = Path(new_dir)
+                self.download_manager.set_download_dir(self.download_dir)
+            # Reconfigure provider: Invidious vs yt-dlp
+            proxy = (self.settings.get("http_proxy") or "").strip() or None
+            use_invid = bool(self.settings.get("use_invidious"))
+            invid_base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
+            try:
+                if use_invid:
+                    self.provider = InvidiousProvider(invid_base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+                else:
+                    self.provider = YTDLPProvider(proxy or None)
+            except Exception:
+                # fallback to yt-dlp
+                self.provider = YTDLPProvider(proxy or None)
+
+        win.connect("close-request", persist)
+
+    def _on_main_close(self, *_a) -> bool:
+        save_settings(self.settings)
+        return False
+
+    def _set_welcome(self) -> None:
+        self.navigation_controller.clear_history()
+        self._clear_results()
+        self.results_box.append(_spacer(16))
+        label = Gtk.Label(
+            label="Type a search and press Enter.\nOr click Open URL / Quick Download.",
+            justify=Gtk.Justification.CENTER,
+        )
+        label.set_xalign(0.5)
+        label.set_yalign(0.5)
+        self.results_box.append(label)
+        self.navigation_controller.show_view("results")
+
+    def _clear_results(self) -> None:
+        child = self.results_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.results_box.remove(child)
+            child = nxt
+
+    # ---------- Header actions ----------
+
+    def _on_open_url(self, *_a) -> None:
+        dlg = Gtk.Dialog(title="Open URL", transient_for=self, modal=True)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Paste a YouTube URL (video/channel/playlist)…")
+        box = dlg.get_content_area()
+        box.append(entry)
+        dlg.add_button("Open", Gtk.ResponseType.OK)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg.present()
+
+        def on_response(d: Gtk.Dialog, resp):
+            try:
+                if resp == Gtk.ResponseType.OK:
+                    url = entry.get_text().strip()
+                    if url:
+                        self._browse_url(url)
+            finally:
+                d.destroy()
+
+        dlg.connect("response", on_response)
+
+    def _on_history(self, *_a) -> None:
+        vids = list_watch(limit=200)
+        self._populate_results(vids)
+        self.navigation_controller.show_view("results")
+
+    def _on_quick_download(self, *_a) -> None:
+        QuickDownloadWindow(self).present()
+
+    def _on_feed(self, *_a) -> None:
+        # Show loading, then fetch recent uploads from each followed channel
+        self._show_loading("Loading feed…")
+        def worker():
+            vids_all = []
+            try:
+                subs = list_subscriptions()
+                per_chan = 5
+                for sub in subs:
+                    try:
+                        vids = self.provider.channel_tab(sub.url, "videos")
+                        if vids:
+                            vids_all.extend(vids[:per_chan])
+                    except Exception:
+                        continue
+            except Exception:
+                vids_all = []
+            GLib.idle_add(self._populate_results, vids_all)
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Browse helpers ----------
+
+    def _browse_url(self, url: str) -> None:
+        self._show_loading(f"Opening: {url}")
+
+        def worker():
+            vids = self.provider.browse_url(url)
+            GLib.idle_add(self._populate_results, vids)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Search ----------
+
+    def _on_search_activate(self, entry: Gtk.SearchEntry) -> None:
+        query = entry.get_text().strip()
+        if not query:
+            return
+        add_search_term(query)
+        self._run_search(query)
+
+    def _run_search(self, query: str) -> None:
+        log.info("Searching: %s", query)
+        self._show_loading(f"Searching: {query}")
+
+        gen = self._search_generation = self._search_generation + 1
+
+        def worker() -> None:
+            try:
+                # Extract filters from settings
+                order = (self.settings.get("search_order") or "relevance")
+                duration = (self.settings.get("search_duration") or "any")
+                period = (self.settings.get("search_period") or "any")
+                # Normalize "any" to None
+                order = None if str(order).lower() == "relevance" else order
+                duration = None if str(duration).lower() == "any" else duration
+                period = None if str(period).lower() == "any" else period
+                results = self.provider.search(query, limit=30, order=order, duration=duration, period=period)
+            except Exception as e:
+                log.exception("Search failed")
+                GLib.idle_add(self._show_error, f"Search failed: {e}")
+                return
+            if gen != self._search_generation:
+                return
+            GLib.idle_add(self._populate_results, results)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_error(self, msg: str) -> None:
+        self._clear_results()
+        lbl = Gtk.Label(label=msg)
+        lbl.add_css_class("error")
+        self.results_box.append(lbl)
+        self.navigation_controller.show_view("results")
+
+    def _populate_results(self, videos: list[Video]) -> None:
+        self._clear_results()
+        if not videos:
+            self.results_box.append(Gtk.Label(label="No results."))
+            return
+        for v in videos:
+            row = ResultRow(
+                video=v,
+                on_play=self._play_video,
+                on_download_opts=self._download_options,
+                on_open=self._open_item,
+                on_related=self._on_related,
+                on_comments=self._on_comments,
+                thumb_loader_pool=self._thumb_loader_pool,
+                on_follow=self._follow_channel,
+                on_unfollow=self._unfollow_channel,
+                followed=is_followed(v.url) if v.kind == "channel" else False,
+            )
+            self.results_box.append(row)
+
+    def _follow_channel(self, video: Video) -> None:
+        try:
+            add_subscription(video.url, video.title)
+        except Exception:
+            pass
+
+    def _unfollow_channel(self, video: Video) -> None:
+        try:
+            remove_subscription(video.url)
+        except Exception:
+            pass
+
+    # ---------- Item actions ----------
+
+    def _open_item(self, video: Video) -> None:
+        # For playlists/channels/comments: open URL to list inner entries or view.
+        if video.kind == "playlist":
+            self._open_playlist(video.url)
+        elif video.kind == "channel":
+            self._open_channel(video.url)
+        elif video.kind == "comment":
+            self._browse_url(video.url)
+        else:
+            self._play_video(video)
+
+    def _open_playlist(self, url: str) -> None:
+        self._show_loading("Opening playlist…")
+
+        def worker():
+            vids = self.provider.playlist(url)
+            GLib.idle_add(self._populate_results, vids)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_channel(self, url: str) -> None:
+        self._show_loading("Opening channel…")
+
+        def worker():
+            vids = self.provider.channel_tab(url, "videos")
+            GLib.idle_add(self._populate_results, vids)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_related(self, video: Video) -> None:
+        self._show_loading(f"Related to: {video.title}")
+
+        def worker():
+            vids = self.provider.related(video.url)
+            GLib.idle_add(self._populate_results, vids)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_comments(self, video: Video) -> None:
+        self._show_loading(f"Comments for: {video.title}")
+
+        def worker():
+            vids = self.provider.comments(video.url, max_comments=100)
+            GLib.idle_add(self._populate_results, vids)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _play_video(self, video: Video) -> None:
+        # Save to watch history
+        add_watch(video)
+
+        mode = self.settings.get("playback_mode", "external")
+        mpv_args = self.settings.get("mpv_args", "") or ""
+        # Quality preset
+        q = (self.settings.get("mpv_quality") or "auto").strip()
+        if q and q != "auto":
+            try:
+                h = int(q)
+                ytdl_fmt = f'bv*[height<={h}]+ba/b[height<={h}]'
+                mpv_args = f'{mpv_args} --ytdl-format="{ytdl_fmt}"'.strip()
+            except Exception:
+                pass
+
+        # Optional cookies for playback
+        if self.settings.get("mpv_cookies_enable"):
+            cookie_arg = self._mpv_cookie_arg()
+            if cookie_arg:
+                mpv_args = f"{mpv_args} {cookie_arg}".strip()
+
+        if mode == "embedded":
+            ok = self.mpv_widget.play(video.url)
+            if ok:
+                self.navigation_controller.show_view("player")
+                return
+
+        if not has_mpv():
+            self._show_error("MPV not found in PATH.")
+            return
+        try:
+            # Unique IPC path per launch to avoid collisions
+            rnd = secrets.token_hex(4)
+            ipc_path = f"/tmp/whirltube-mpv-{os.getpid()}-{rnd}.sock"
+            proc = start_mpv(video.url, extra_args=mpv_args, ipc_server_path=ipc_path)
+            self._mpv_proc = proc
+            self._mpv_ipc = ipc_path
+            self._mpv_speed = 1.0
+            self.ctrl_bar.set_visible(True)
+
+            # Watcher thread: hide controls on exit
+            def _watch():
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                GLib.idle_add(self._on_mpv_exit)
+            threading.Thread(target=_watch, daemon=True).start()
+        except Exception as e:
+            self._show_error(f"Failed to start MPV: {e}")
+
+    def _on_mpv_exit(self) -> None:
+        self._mpv_proc = None
+        self._mpv_ipc = None
+        self.ctrl_bar.set_visible(False)
+
+    def _mpv_cookie_arg(self) -> str:
+        browser = (self.settings.get("mpv_cookies_browser") or "").strip()
+        if not browser:
+            return ""
+        keyring = (self.settings.get("mpv_cookies_keyring") or "").strip()
+        profile = (self.settings.get("mpv_cookies_profile") or "").strip()
+        container = (self.settings.get("mpv_cookies_container") or "").strip()
+        val = browser
+        if keyring:
+            val += f"+{keyring}"
+        if profile or container:
+            val += f":{profile}"
+        if container:
+            val += f"::{container}"
+        return f'--ytdl-raw-options=cookies-from-browser={val}'
+
+    def _mpv_cycle_pause(self) -> None:
+        if not self._mpv_ipc:
+            return
+        mpv_send_cmd(self._mpv_ipc, ["cycle", "pause"])
+
+    def _mpv_seek(self, secs: int) -> None:
+        if not self._mpv_ipc:
+            return
+        mpv_send_cmd(self._mpv_ipc, ["seek", secs, "relative"])
+
+    def _mpv_speed_delta(self, delta: float) -> None:
+        if not self._mpv_ipc:
+            return
+        try:
+            self._mpv_speed = max(0.1, min(4.0, self._mpv_speed + delta))
+        except Exception:
+            self._mpv_speed = 1.0
+        mpv_send_cmd(self._mpv_ipc, ["set_property", "speed", round(self._mpv_speed, 2)])
+
+    def _mpv_stop(self) -> None:
+        # Prefer quit over kill where possible
+        if self._mpv_ipc:
+            mpv_send_cmd(self._mpv_ipc, ["quit"])
+        proc = getattr(self, "_mpv_proc", None)
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._mpv_proc = None
+        self._mpv_ipc = None
+        self.ctrl_bar.set_visible(False)
+
+    def _filters_load_from_settings(self) -> None:
+        dur = (self.settings.get("search_duration") or "any").lower()
+        per = (self.settings.get("search_period") or "any").lower()
+        ordv = (self.settings.get("search_order") or "relevance").lower()
+        # Map to indices
+        dur_idx = {"any":0, "short":1, "medium":2, "long":3}.get(dur, 0)
+        per_idx = {"any":0, "today":1, "week":2, "month":3}.get(per, 0)
+        ord_idx = {"relevance":0, "date":1, "views":2}.get(ordv, 0)
+        try:
+            self.dd_dur.set_selected(dur_idx)
+            self.dd_period.set_selected(per_idx)
+            self.dd_order.set_selected(ord_idx)
+        except Exception:
+            pass
+
+    def _filters_apply(self, *_a) -> None:
+        # Save UI selections into settings and persist
+        dur_map = {0:"any", 1:"short", 2:"medium", 3:"long"}
+        per_map = {0:"any", 1:"today", 2:"week", 3:"month"}
+        ord_map = {0:"relevance", 1:"date", 2:"views"}
+        self.settings["search_duration"] = dur_map.get(self.dd_dur.get_selected(), "any")
+        self.settings["search_period"] = per_map.get(self.dd_period.get_selected(), "any")
+        self.settings["search_order"] = ord_map.get(self.dd_order.get_selected(), "relevance")
+        save_settings(self.settings)
+        self._filters_pop.popdown()
+
+    def _filters_clear(self, *_a) -> None:
+        self.settings["search_duration"] = "any"
+        self.settings["search_period"] = "any"
+        self.settings["search_order"] = "relevance"
+        save_settings(self.settings)
+        self._filters_load_from_settings()
+
+    # ---------- Downloads ----------
+
+    def _download_options(self, video: Video) -> None:
+        dlg = DownloadOptionsWindow(self, video.title)
+
+        def fetch_formats(_btn):
+            def worker() -> None:
+                try:
+                    fmts = self.provider.fetch_formats(video.url)
+                except Exception:
+                    fmts = []
+                GLib.idle_add(dlg.set_formats, fmts)
+
+        dlg.btn_fetch.connect("clicked", fetch_formats)
+        dlg.present()
+
+        def after_close(_w, *_a):
+            accepted, opts = dlg.get_options()
+            if accepted:
+                self._download_video_with_options(video, opts)
+
+        dlg.connect("close-request", after_close)
+
+    def _download_video_with_options(self, video: Video, opts: DownloadOptions) -> None:
+        self.download_manager.start_download(video, opts)
+
+    def _show_downloads(self, *_args) -> None:
+        self.navigation_controller.show_view("downloads")
+
+
+class ResultRow(Gtk.Box):
+    def __init__(
+        self,
+        video: Video,
+        on_play: Callable[[Video], None],
+        on_download_opts: Callable[[Video], None],
+        on_open: Callable[[Video], None],
+        on_related: Callable[[Video], None],
+        on_comments: Callable[[Video], None],
+        thumb_loader_pool: ThreadPoolExecutor,
+        on_follow: Callable[[Video], None] | None = None,
+        on_unfollow: Callable[[Video], None] | None = None,
+        followed: bool = False,
+    ) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.video = video
+        self.on_play = on_play
+        self.on_download_opts = on_download_opts
+        self.on_open = on_open
+        self.on_related = on_related
+        self.on_comments = on_comments
+        self.thumb_loader_pool = thumb_loader_pool
+        self.on_follow = on_follow
+        self.on_unfollow = on_unfollow
+        self._followed = followed
+        self._http_proxy = http_proxy
+
+        self.set_margin_top(6)
+        self.set_margin_bottom(6)
+
+        # Thumbnail
+        self.thumb = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
+        self.thumb.set_size_request(160, 90)
+        self.append(self.thumb)
+
+        # Texts
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+        title = Gtk.Label(label=video.title, wrap=True, xalign=0.0)
+        title.add_css_class("title-3")
+        meta = Gtk.Label(label=_fmt_meta(video), xalign=0.0)
+        meta.add_css_class("dim-label")
+        box.append(title)
+        box.append(meta)
+        self.append(box)
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        if video.is_playable:
+            play_btn = Gtk.Button(label="Play")
+            play_btn.connect("clicked", lambda *_: self.on_play(self.video))
+            dl_btn = Gtk.Button(label="Download…")
+            dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
+            rel_btn = Gtk.Button(label="Related")
+            rel_btn.connect("clicked", lambda *_: self.on_related(self.video))
+            cmt_btn = Gtk.Button(label="Comments")
+            cmt_btn.connect("clicked", lambda *_: self.on_comments(self.video))
+            btn_box.append(play_btn)
+            btn_box.append(dl_btn)
+            btn_box.append(rel_btn)
+            btn_box.append(cmt_btn)
+        else:
+            # Non-playable: show Open; if channel, also Follow/Unfollow
+            open_btn = Gtk.Button(label="Open")
+            open_btn.set_tooltip_text("Open this playlist/channel")
+            open_btn.connect("clicked", lambda *_: self.on_open(self.video))
+            btn_box.append(open_btn)
+            if self.video.kind == "channel":
+                label = "Unfollow" if self._followed else "Follow"
+                follow_btn = Gtk.Button(label=label)
+                def _toggle_follow(_btn):
+                    try:
+                        if self._followed:
+                            if self.on_unfollow: self.on_unfollow(self.video)
+                            self._followed = False
+                            _btn.set_label("Follow")
+                        else:
+                            if self.on_follow: self.on_follow(self.video)
+                            self._followed = True
+                            _btn.set_label("Unfollow")
+                    except Exception:
+                        pass
+                follow_btn.connect("clicked", _toggle_follow)
+                btn_box.append(follow_btn)
+        self.append(btn_box)
+
+        # Load thumbnail
+        if video.thumb_url:
+            self.thumb_loader_pool.submit(self._load_thumb)
+        else:
+            # No URL -> placeholder
+            GLib.idle_add(self._set_thumb_placeholder)
+
+    def _load_thumb(self) -> None:
+        try:
+            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._http_proxy or None) as client:
+                r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                r.raise_for_status()
+                data = r.content
+        except Exception:
+            GLib.idle_add(self._set_thumb_placeholder)
+            return
+        GLib.idle_add(self._set_thumb, data)
+
+    def _set_thumb(self, data: bytes) -> None:
+        loader = GdkPixbuf.PixbufLoader()
+        try:
+            loader.write(data)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            if pixbuf:
+                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+                self.thumb.set_paintable(texture)
+                return
+        except Exception:
+            pass
+        # If decoding fails, show placeholder
+        self._set_thumb_placeholder()
+
+    def _set_thumb_placeholder(self) -> None:
+        try:
+            # Replace the picture with a placeholder box to keep consistent size
+            parent = self.thumb.get_parent()
+            if parent is not None:
+                parent.remove(self.thumb)
+        except Exception:
+            pass
+        ph = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        ph.set_size_request(160, 90)
+        ph.set_halign(Gtk.Align.FILL)
+        ph.set_valign(Gtk.Align.FILL)
+        lbl = Gtk.Label(label="No thumbnail", xalign=0.5, yalign=0.5)
+        lbl.add_css_class("dim-label")
+        lbl.set_wrap(True)
+        ph.append(lbl)
+        # Put the placeholder at the start (thumbnail slot)
+        self.prepend(ph)
+
+def _fmt_meta(v: Video) -> str:
+    ch = v.channel or "Unknown channel"
+    dur = v.duration_str
+    base = f"{ch} • {dur}" if dur else ch
+    if v.kind in ("playlist", "channel"):
+        return f"{base} • {v.kind}"
+    return base
+
+def _spacer(px: int) -> Gtk.Box:
+    b = Gtk.Box()
+    b.set_size_request(-1, px)
+    return b
+--- FILE: src/whirltube/download_manager.py ---
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from collections.abc import Callable
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gio, Gtk
+
+from .downloader import DownloadProgress, DownloadTask, RunnerDownloadTask
+from .models import Video
+from .dialogs import DownloadOptions
+from .download_history import add_download
+
+log = logging.getLogger(__name__)
+
+class DownloadRow(Gtk.Box):
+    def __init__(self, task) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.task = task
+
+        self.set_margin_top(6)
+        self.set_margin_bottom(6)
+
+        video = getattr(task, "video", None)
+        title = video.title if video else "Download"
+        self.label = Gtk.Label(label=f"Downloading: {title}", xalign=0.0, wrap=True)
+        self.progress = Gtk.ProgressBar(show_text=True)
+        self.status = Gtk.Label(label="", xalign=0.0)
+
+        # Actions row (open folder/file)
+        self.actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_open_folder = Gtk.Button(label="Open folder")
+        self.btn_open_folder.set_sensitive(False)
+        self.btn_open_folder.connect("clicked", self._open_folder)
+        self.btn_open_file = Gtk.Button(label="Open file")
+        self.btn_open_file.set_sensitive(False)
+        self.btn_open_file.connect("clicked", self._open_file)
+
+        self.actions.append(self.btn_open_folder)
+        self.actions.append(self.btn_open_file)
+
+        self.append(self.label)
+        self.append(self.progress)
+        self.append(self.status)
+        self.append(self.actions)
+
+    def update_progress(self, p: DownloadProgress) -> None:
+        frac = 0.0
+        if p.bytes_total and p.bytes_total > 0:
+            frac = min(1.0, max(0.0, p.bytes_downloaded / p.bytes_total))
+        self.progress.set_fraction(frac)
+        self.progress.set_text(_fmt_dl_text(p))
+        self.status.set_text(_fmt_dl_status(p))
+
+        if p.status == "finished":
+            # Enable actions
+            self.btn_open_folder.set_sensitive(True)
+            if p.filename:
+                self.btn_open_file.set_sensitive(True)
+
+    def _open_folder(self, *_a) -> None:
+        try:
+            dest = getattr(self.task, "dest_dir", None)
+            if isinstance(dest, Path) and dest.exists():
+                Gio.AppInfo.launch_default_for_uri(f"file://{dest}", None)
+        except Exception:
+            pass
+
+    def _open_file(self, *_a) -> None:
+        try:
+            p: DownloadProgress = getattr(self.task, "progress", None)
+            dest: Path = getattr(self.task, "dest_dir", None)
+            if p and p.filename:
+                fp = Path(p.filename)
+                # If filename isn't absolute, resolve against dest_dir
+                if not fp.is_absolute() and isinstance(dest, Path):
+                    fp = dest / fp
+                if fp.exists():
+                    Gio.AppInfo.launch_default_for_uri(f"file://{fp}", None)
+        except Exception:
+            pass
+
+def _fmt_dl_text(p: DownloadProgress) -> str:
+    if p.status == "finished":
+        return "100% (done)"
+    if p.bytes_total:
+        pct = int((p.bytes_downloaded / p.bytes_total) * 100)
+        return f"{pct}%"
+    if p.bytes_downloaded:
+        kb = p.bytes_downloaded / 1024
+        return f"{kb:.1f} KiB"
+    return ""
+
+def _fmt_dl_status(p: DownloadProgress) -> str:
+    if p.status == "finished":
+        return f"Saved: {p.filename or ''}"
+    if p.status == "error":
+        return f"Error: {p.error or 'unknown'}"
+    parts = []
+    if p.speed_bps:
+        mbps = p.speed_bps / (1024 * 1024)
+        parts.append(f"{mbps:.2f} MiB/s")
+    if p.eta:
+        parts.append(f"ETA {p.eta:d}s")
+    return " • ".join(parts)
+
+
+class DownloadManager:
+    def __init__(self, downloads_box: Gtk.Box, show_downloads_view: Callable[[None], None], get_setting: Callable[[str], str|bool|int|None], show_error: Callable[[str], None]) -> None:
+        self.downloads_box = downloads_box
+        self.show_downloads_view = show_downloads_view
+        self.get_setting = get_setting
+        self.show_error = show_error
+        self.download_dir: Path | None = None # This will be set by MainWindow
+
+    def set_download_dir(self, path: Path) -> None:
+        self.download_dir = path
+
+    def _ensure_download_dir(self, path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return True
+        except Exception as e:
+            self.show_error(f"Cannot create download directory: {e}")
+            return False
+
+    def start_download(self, video: Video, opts: DownloadOptions) -> None:
+        dest_dir = opts.target_dir or Path(self.get_setting("download_dir") or str(self.download_dir))
+        if not self._ensure_download_dir(dest_dir):
+            return
+
+        advanced = (
+            bool(opts.extra_flags.strip())
+            or bool(opts.sort_string.strip())
+            or bool(opts.sb_mark.strip())
+            or bool(opts.sb_remove.strip())
+            or opts.embed_metadata
+            or opts.embed_thumbnail
+            or opts.write_thumbnail
+            or bool(opts.limit_rate.strip())
+            or (opts.concurrent_fragments > 0)
+            or bool(opts.impersonate.strip())
+            or (opts.use_cookies and bool(opts.cookies_browser.strip()))
+        )
+
+        if advanced:
+            cli = opts.raw_cli_list()
+            # Inject global proxy if configured and not set explicitly
+            proxy = self.get_setting("http_proxy")
+            if isinstance(proxy, str) and proxy.strip() and "--proxy" not in cli:
+                cli = ["--proxy", proxy.strip()] + cli
+            # Optional custom yt-dlp binary path from settings
+            ytdlp_path = self.get_setting("ytdlp_path")
+            if not isinstance(ytdlp_path, str) or not ytdlp_path.strip():
+                ytdlp_path = None
+            task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path)
+            row = DownloadRow(task)
+            self.downloads_box.append(row)
+            self.show_downloads_view()
+
+            def on_update(p: DownloadProgress) -> None:
+                GLib.idle_add(row.update_progress, p)
+                if p.status == "finished":
+                    try:
+                        add_download(video, dest_dir, p.filename)
+                    except Exception:
+                        pass
+
+            task.start(on_update)
+            return
+
+        ydl_override = opts.to_ydl_opts()
+        proxy = self.get_setting("http_proxy")
+        if isinstance(proxy, str) and proxy.strip():
+            ydl_override["proxy"] = proxy.strip()
+
+        dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
+        row = DownloadRow(dl_task)
+        self.downloads_box.append(row)
+        self.show_downloads_view()
+
+        def on_update(p: DownloadProgress) -> None:
+            GLib.idle_add(row.update_progress, p)
+            if p.status == "finished":
+                try:
+                    add_download(video, dest_dir, p.filename)
+                except Exception:
+                    pass
+
+        dl_task.start(on_update)
+--- FILE: src/whirltube/navigation_controller.py ---
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk
+
+class NavigationController:
+    def __init__(self, stack: Gtk.Stack, btn_back: Gtk.Button) -> None:
+        self.stack = stack
+        self.btn_back = btn_back
+        self._nav_stack: list[str] = []  # back stack of stack view names
+
+        self.btn_back.connect("clicked", self.go_back)
+        self._update_back_button_visibility()
+
+    def _update_back_button_visibility(self) -> None:
+        self.btn_back.set_visible(bool(self._nav_stack))
+
+    def show_view(self, name: str) -> None:
+        cur = self.stack.get_visible_child_name() or "results"
+        if cur != name:
+            self._nav_stack.append(cur)
+        self.stack.set_visible_child_name(name)
+        self._update_back_button_visibility()
+
+    def go_back(self, *_a) -> None:
+        if self._nav_stack:
+            prev = self._nav_stack.pop()
+            self.stack.set_visible_child_name(prev)
+        else:
+            self.stack.set_visible_child_name("results")
+        self._update_back_button_visibility()
+
+    def clear_history(self) -> None:
+        self._nav_stack.clear()
+        self._update_back_button_visibility()
+
+--- FILE: src/whirltube/subscriptions.py ---
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .util import xdg_data_dir
+
+_SUBS_PATH = xdg_data_dir() / "subscriptions.json"
+
+@dataclass(slots=True)
+class Subscription:
+    url: str
+    title: str | None = None
+
+def _load_raw() -> list[dict[str, Any]]:
+    if not _SUBS_PATH.exists():
+        return []
+    try:
+        data = json.loads(_SUBS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+def _save_raw(items: list[dict[str, Any]]) -> None:
+    _SUBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _SUBS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    tmp.replace(_SUBS_PATH)
+
+def list_subscriptions() -> list[Subscription]:
+    out: list[Subscription] = []
+    for it in _load_raw():
+        url = (it.get("url") or "").strip()
+        if not url:
+            continue
+        title = (it.get("title") or None)
+        out.append(Subscription(url=url, title=title))
+    return out
+
+def is_followed(url: str) -> bool:
+    u = (url or "").strip()
+    if not u:
+        return False
+    for it in _load_raw():
+        if (it.get("url") or "").strip() == u:
+            return True
+    return False
+
+def add_subscription(url: str, title: str | None = None) -> bool:
+    u = (url or "").strip()
+    if not u:
+        return False
+    data = _load_raw()
+    for it in data:
+        if (it.get("url") or "").strip() == u:
+            return False  # already present
+    data.append({"url": u, "title": title or None})
+    _save_raw(data)
+    return True
+
+def remove_subscription(url: str) -> bool:
+    u = (url or "").strip()
+    if not u:
+        return False
+    data = _load_raw()
+    new = [it for it in data if (it.get("url") or "").strip() != u]
+    if len(new) == len(data):
+        return False
+    _save_raw(new)
+    return True
+def export_subscriptions(dest: Path) -> bool:
+    """
+    Write current subscriptions to dest as pretty JSON.
+    Returns True on success.
+    """
+    try:
+        items = _load_raw()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        tmp.replace(dest)
+        return True
+    except Exception:
+        return False
+
+def import_subscriptions(src: Path) -> int:
+    """
+    Merge subscriptions from src (list of {url, title}) with existing ones.
+    Returns number of new entries added.
+    """
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return 0
+        existing = _load_raw()
+        have = { (it.get("url") or "").strip() for it in existing if isinstance(it, dict) }
+        added = 0
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            u = (it.get("url") or "").strip()
+            if not u or u in have:
+                continue
+            existing.append({"url": u, "title": (it.get("title") or None)})
+            have.add(u)
+            added += 1
+        if added:
+            _save_raw(existing)
+        return added
+    except Exception:
+        return 0
+
+--- FILE: src/whirltube/download_history.py ---
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from .models import Video
+from .util import xdg_data_dir
+
+_DL = xdg_data_dir() / "download_history.jsonl"
+
+@dataclass(slots=True)
+class DownloadEntry:
+    id: str
+    title: str
+    url: str
+    channel: str | None
+    duration: int | None
+    thumb_url: str | None
+    kind: str
+    dest_dir: str
+    filename: str | None
+    ts: int
+
+def add_download(video: Video, dest_dir: Path, filename: str | None) -> None:
+    _DL.parent.mkdir(parents=True, exist_ok=True)
+    e = DownloadEntry(
+        id=video.id,
+        title=video.title,
+        url=video.url,
+        channel=video.channel,
+        duration=video.duration,
+        thumb_url=video.thumb_url,
+        kind=video.kind,
+        dest_dir=str(dest_dir),
+        filename=filename,
+        ts=int(time.time()),
+    )
+    with _DL.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(asdict(e), ensure_ascii=False) + "\n")
+
+def list_downloads(limit: int = 300) -> list[Video]:
+    if not _DL.exists():
+        return []
+    out: list[Video] = []
+    lines = _DL.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            it: dict[str, Any] = json.loads(line)
+            out.append(
+                Video(
+                    id=str(it.get("id") or ""),
+                    title=it.get("title") or "",
+                    url=it.get("url") or "",
+                    channel=it.get("channel"),
+                    duration=it.get("duration"),
+                    thumb_url=it.get("thumb_url"),
+                    kind=str(it.get("kind") or "video"),
+                )
+            )
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
+--- FILE: src/whirltube/invidious_provider.py ---
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from .models import Video
+from .provider import YTDLPProvider, _ensure_channel_root  # reuse helpers where helpful
+
+log = logging.getLogger(__name__)
+
+@dataclass(slots=True)
+class _Cfg:
+    base: str
+    proxy: str | None = None
+    timeout: float = 12.0
+
+class InvidiousProvider:
+    """
+    Minimal Invidious API provider for search and channel videos.
+    Falls back to YTDLPProvider for unsupported operations.
+    """
+    def __init__(self, base_url: str, proxy: str | None = None, fallback: YTDLPProvider | None = None) -> None:
+        self.cfg = _Cfg(base=base_url.rstrip("/"), proxy=proxy)
+        self._fallback = fallback or YTDLPProvider()
+        self._client: httpx.Client | None = None
+        self._init_client()
+
+    def set_proxy(self, proxy: str | None) -> None:
+        self.cfg.proxy = proxy or None
+        self._init_client()
+
+    def _init_client(self) -> None:
+        try:
+            if self._client:
+                self._client.close()
+        except Exception:
+            pass
+        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=self.cfg.proxy, headers={"User-Agent": "whirltube/0.4"})
+
+    # ---------- Search ----------
+
+    def search(self, query: str, limit: int = 20, order: str | None = None, duration: str | None = None, period: str | None = None) -> list[Video]:
+        q = (query or "").strip()
+        if not q:
+            return []
+        params: dict[str, Any] = {
+            "q": q,
+            "type": "video",
+            "page": 1,
+        }
+        # Map order
+        ordv = (order or "").lower().strip()
+        if ordv == "date":
+            params["sort_by"] = "upload_date"
+        elif ordv == "views":
+            params["sort_by"] = "view_count"
+        else:
+            params["sort_by"] = "relevance"
+
+        # Optional search filters (best effort)
+        # period -> time; Invidious may support 'hour','day','week','month','year' in some instances. We'll approximate client-side below as well.
+        per = (period or "").lower().strip()
+        if per == "today":
+            params["date"] = "today"
+        elif per == "week":
+            params["date"] = "week"
+        elif per == "month":
+            params["date"] = "month"
+
+        # Fetch
+        try:
+            assert self._client is not None
+            r = self._client.get(f"{self.cfg.base}/api/v1/search", params=params)
+            r.raise_for_status()
+            data = r.json()
+            items: Iterable[dict] = data if isinstance(data, list) else []
+        except Exception as e:
+            log.debug("Invidious search failed (%s); fallback to yt-dlp", e)
+            # Fallback to yt-dlp provider with same filters
+            return self._fallback.search(query, limit=limit, order=order, duration=duration, period=period)
+
+        vids: list[Video] = []
+        now = int(time.time())
+
+        def _dur_ok(seconds: int | None) -> bool:
+            d = int(seconds or 0)
+            dtag = (duration or "").lower().strip()
+            if not dtag or dtag == "any":
+                return True
+            if dtag == "short":
+                return 0 < d < 4 * 60
+            if dtag == "medium":
+                return 4 * 60 <= d <= 20 * 60
+            if dtag == "long":
+                return d > 20 * 60
+            return True
+
+        def _time_ok(published: int | None) -> bool:
+            ptag = (period or "").lower().strip()
+            if not ptag or ptag == "any":
+                return True
+            if not published:
+                return True  # keep unknowns
+            day = 86400
+            cutoff = now - (day if ptag == "today" else 7 * day if ptag == "week" else 30 * day)
+            return published >= cutoff
+
+        for it in items:
+            try:
+                if it.get("type") != "video":
+                    continue
+                dur = int(it.get("lengthSeconds") or 0)
+                pub = int(it.get("published") or 0)
+                if not _dur_ok(dur) or not _time_ok(pub):
+                    continue
+                vid = str(it.get("videoId") or "")
+                url = f"https://www.youtube.com/watch?v={vid}" if vid else (it.get("videoThumbnails") or [{}])[0].get("url", "")
+                thumb = None
+                thumbs = it.get("videoThumbnails") or []
+                if thumbs and isinstance(thumbs, list):
+                    # pick the widest
+                    best = max((t for t in thumbs if isinstance(t, dict)), key=lambda x: int(x.get("width") or 0), default=None)
+                    if best:
+                        thumb = best.get("url")
+                vids.append(
+                    Video(
+                        id=vid or url,
+                        title=it.get("title") or "(untitled)",
+                        url=url,
+                        channel=it.get("author") or None,
+                        duration=dur or None,
+                        thumb_url=thumb,
+                        kind="video",
+                    )
+                )
+                if len(vids) >= limit:
+                    break
+            except Exception:
+                continue
+        return vids
+
+    # ---------- Browse helpers ----------
+
+    def _channel_id_from_url(self, url: str) -> str | None:
+        u = (url or "").strip()
+        # Only support /channel/UC... robustly; other forms fallback
+        i = u.find("/channel/")
+        if i >= 0:
+            cid = u[i + len("/channel/") :].split("/")[0]
+            if cid:
+                return cid
+        return None
+
+    def channel_tab(self, chan_url: str, tab: str = "videos") -> list[Video]:
+        cid = self._channel_id_from_url(chan_url)
+        if not cid:
+            return self._fallback.channel_tab(chan_url, tab=tab)
+        try:
+            assert self._client is not None
+            r = self._client.get(f"{self.cfg.base}/api/v1/channels/{cid}/videos", params={"page": 1})
+            r.raise_for_status()
+            data = r.json()
+            items: Iterable[dict] = data.get("videos") if isinstance(data, dict) else []
+        except Exception as e:
+            log.debug("Invidious channel_tab failed (%s); fallback to yt-dlp", e)
+            return self._fallback.channel_tab(chan_url, tab=tab)
+
+        out: list[Video] = []
+        for it in items or []:
+            try:
+                vid = str(it.get("videoId") or "")
+                url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
+                dur = int(it.get("lengthSeconds") or 0) or None
+                thumb = None
+                thumbs = it.get("videoThumbnails") or []
+                if thumbs and isinstance(thumbs, list):
+                    best = max((t for t in thumbs if isinstance(t, dict)), key=lambda x: int(x.get("width") or 0), default=None)
+                    if best:
+                        thumb = best.get("url")
+                out.append(
+                    Video(
+                        id=vid or url,
+                        title=it.get("title") or "(untitled)",
+                        url=url or it.get("authorUrl") or "",
+                        channel=it.get("author") or None,
+                        duration=dur,
+                        thumb_url=thumb,
+                        kind="video",
+                    )
+                )
+            except Exception:
+                continue
+        return out
+
+    def browse_url(self, url: str) -> list[Video]:
+        # We can only handle channels robustly when /channel/UC...; otherwise fallback
+        if "/channel/" in (url or ""):
+            return self.channel_tab(url, "videos")
+        return self._fallback.browse_url(url)
+
+    # ---------- Delegated methods ----------
+
+    def playlist(self, playlist_url: str) -> list[Video]:
+        return self._fallback.playlist(playlist_url)
+
+    def related(self, video_url: str) -> list[Video]:
+        return self._fallback.related(video_url)
+
+    def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
+        return self._fallback.comments(video_url, max_comments=max_comments)
+
+    def fetch_formats(self, url: str) -> list[tuple[str, str]]:
+        return self._fallback.fetch_formats(url)
+--- FILE: tests/test_smoke.py ---
+def test_import():
+    import whirltube  # noqa: F401
+
+
+def test_entrypoint():
+    from whirltube.app import main
+
+    assert callable(main)
+

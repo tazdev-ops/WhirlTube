@@ -1,0 +1,14 @@
+snapshot.txt
+digest/
+.tripwire/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.tar.gz
+.venv/
+venv/
+*.bak
+# Ignore editor/backup files
+*.bak
