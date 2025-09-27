@@ -476,6 +476,9 @@ class PreferencesWindow(Adw.PreferencesWindow):
         group_play = Adw.PreferencesGroup(title="Player")
         page_play.add(group_play)
 
+        # Provider page
+        page_provider = Adw.PreferencesPage(title="Provider")
+
         # Playback mode
         self.playback_mode = Adw.ComboRow(
             title="Default playback mode",
@@ -533,6 +536,17 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_container.set_text(settings.get("mpv_cookies_container", ""))
         cookies_group.add(self.entry_container)
 
+        # Provider group (Invidious)
+        group_provider = Adw.PreferencesGroup(title="Invidious")
+        page_provider.add(group_provider)
+        self.use_invidious = Adw.SwitchRow(title="Use Invidious backend for search/channel")
+        self.use_invidious.set_active(bool(settings.get("use_invidious", False)))
+        group_provider.add(self.use_invidious)
+
+        self.entry_invidious = Adw.EntryRow(title="Invidious instance")
+        self.entry_invidious.set_text(settings.get("invidious_instance", "https://yewtu.be"))
+        group_provider.add(self.entry_invidious)
+
         # Downloads page
         page_dl = Adw.PreferencesPage(title="Downloads")
         group_dl = Adw.PreferencesGroup(title="Location")
@@ -564,6 +578,7 @@ class PreferencesWindow(Adw.PreferencesWindow):
         group_queue.add(self.spin_concurrent)
 
         self.add(page_play)
+        self.add(page_provider)
         self.add(page_dl)
 
         self.connect("close-request", self._on_close)
@@ -602,4 +617,7 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.settings["http_proxy"] = self.entry_proxy.get_text()
         # Concurrency
         self.settings["max_concurrent_downloads"] = int(self.spin_concurrent.get_value())
+        # Provider settings
+        self.settings["use_invidious"] = bool(self.use_invidious.get_active())
+        self.settings["invidious_instance"] = self.entry_invidious.get_text().strip() or "https://yewtu.be"
         return False

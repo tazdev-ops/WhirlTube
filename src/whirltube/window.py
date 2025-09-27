@@ -124,6 +124,8 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Export Subscriptions…", "win.subs_export")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("Download History", "win.download_history")
+        menu.append("Cancel All Downloads", "win.cancel_all_downloads")
+        menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
         menu.append("Quit", "app.quit")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_btn.set_menu_model(menu)
@@ -282,6 +284,14 @@ class MainWindow(Adw.ApplicationWindow):
         dlh = Gio.SimpleAction.new("download_history", None)
         dlh.connect("activate", self._on_download_history)
         self.add_action(dlh)
+
+        cancel_all = Gio.SimpleAction.new("cancel_all_downloads", None)
+        cancel_all.connect("activate", lambda *_: self.download_manager.cancel_all())
+        self.add_action(cancel_all)
+
+        clear_fin = Gio.SimpleAction.new("clear_finished_downloads", None)
+        clear_fin.connect("activate", lambda *_: self.download_manager.clear_finished())
+        self.add_action(clear_fin)
 
         # Subscriptions actions (menu entries exist, actions were missing)
         subs = Gio.SimpleAction.new("subscriptions", None)
@@ -948,6 +958,9 @@ class ResultRow(Gtk.Box):
         copy_url.connect("clicked", lambda *_: self._copy_url())
         copy_title = Gtk.Button(label="Copy Title")
         copy_title.connect("clicked", lambda *_: self._copy_title())
+        # Add spacing between common actions group and primary actions
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        btn_box.append(sep)
         btn_box.append(open_web)
         btn_box.append(copy_url)
         btn_box.append(copy_title)
