@@ -110,7 +110,7 @@ def _fmt_dl_status(p: DownloadProgress) -> str:
 
 
 class DownloadManager:
-    def __init__(self, downloads_box: Gtk.Box, show_downloads_view: Callable[[None], None], get_setting: Callable[[str], str|bool|int|None], show_error: Callable[[str], None]) -> None:
+    def __init__(self, downloads_box: Gtk.Box, show_downloads_view: Callable[[], None], get_setting: Callable[[str], str|bool|int|None], show_error: Callable[[str], None]) -> None:
         self.downloads_box = downloads_box
         self.show_downloads_view = show_downloads_view
         self.get_setting = get_setting
