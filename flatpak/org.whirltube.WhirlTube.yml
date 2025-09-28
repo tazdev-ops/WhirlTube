@@ -1,0 +1,23 @@
+app-id: org.whirltube.WhirlTube
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+command: whirltube
+finish-args:
+  - --share=network
+  - --socket=x11
+  - --socket=wayland
+  - --filesystem=home
+  - --talk-name=org.freedesktop.secrets
+modules:
+  - name: python3-deps
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-cache --prefix=/app httpx yt-dlp
+  - name: whirltube
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-cache --prefix=/app .
+    sources:
+      - type: dir
+        path: ..

@@ -89,6 +89,9 @@ class MainWindow(Adw.ApplicationWindow):
         # MPV control bar (hidden by default; shown for external MPV)
         self.ctrl_bar = Adw.HeaderBar()
         self.ctrl_bar.set_title_widget(Gtk.Label(label="MPV Controls", css_classes=["dim-label"]))
+        # Toast overlay wrappers the whole UI
+        self.toast_overlay = Adw.ToastOverlay()
+        self.set_content(self.toast_overlay)
         # Buttons: Seek -10, Play/Pause, Seek +10, Speed -, Speed +, Stop
         self.btn_seek_back = Gtk.Button(icon_name="media-seek-backward-symbolic")
         self.btn_play_pause = Gtk.Button(icon_name="media-playback-pause-symbolic")
@@ -101,9 +104,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.btn_seek_fwd.connect("clicked", lambda *_: self._mpv_seek(10))
         self.btn_speed_down.connect("clicked", lambda *_: self._mpv_speed_delta(-0.1))
         self.btn_speed_up.connect("clicked", lambda *_: self._mpv_speed_delta(0.1))
+        self.btn_copy_ts = Gtk.Button(icon_name="edit-copy-symbolic")
+        self.btn_copy_ts.set_tooltip_text("Copy URL at current time (T)")
+        self.btn_copy_ts.connect("clicked", lambda *_: self._mpv_copy_ts())
         self.btn_stop_mpv.connect("clicked", lambda *_: self._mpv_stop())
         # Pack controls on the right
         self.ctrl_bar.pack_end(self.btn_stop_mpv)
+        self.ctrl_bar.pack_end(self.btn_copy_ts)
         self.ctrl_bar.pack_end(self.btn_speed_up)
         self.ctrl_bar.pack_end(self.btn_speed_down)
         self.ctrl_bar.pack_end(self.btn_seek_fwd)
@@ -128,6 +135,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Download History", "win.download_history")
         menu.append("Cancel All Downloads", "win.cancel_all_downloads")
         menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
+        menu.append("Copy URL @ time", "win.mpv_copy_ts")
         menu.append("Stop MPV", "win.stop_mpv")
         menu.append("Quit", "app.quit")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
@@ -238,6 +246,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.player_box.append(self.mpv_widget)
         self.stack.add_titled(self.player_box, "player", "Player")
 
+        # Place ToolbarView inside the ToastOverlay
+        self.toast_overlay.set_child(self.toolbar_view)
         self.toolbar_view.set_content(self.stack)
 
         # Navigation controller (handles back button)
@@ -261,6 +271,9 @@ class MainWindow(Adw.ApplicationWindow):
         # MPV actions (menu + hotkeys)
         self._install_mpv_actions()
 
+        # Track current URL for timestamp copying
+        self._mpv_current_url: str | None = None
+
         # MPV external player state
         self._mpv_proc = None
         self._mpv_ipc = None
@@ -268,6 +281,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Save settings on window close
         self.connect("close-request", self._on_main_close)
+
+    def _show_toast(self, text: str) -> None:
+        try:
+            self.toast_overlay.add_toast(Adw.Toast.new(text))
+        except Exception:
+            pass
         # React to stack page changes for MPV controls visibility
         self.stack.connect("notify::visible-child", self._on_stack_changed)
 
@@ -311,6 +330,10 @@ class MainWindow(Adw.ApplicationWindow):
         a_speed_up.connect("activate", lambda *_: self._mpv_speed_delta(0.1))
         self.add_action(a_speed_up)
 
+        a_copy_ts = Gio.SimpleAction.new("mpv_copy_ts", None)
+        a_copy_ts.connect("activate", lambda *_: self._mpv_copy_ts())
+        self.add_action(a_copy_ts)
+
         a_stop = Gio.SimpleAction.new("stop_mpv", None)
         a_stop.connect("activate", lambda *_: self._mpv_stop())
         a_stop.set_enabled(False)  # only enabled when mpv running
@@ -327,6 +350,7 @@ class MainWindow(Adw.ApplicationWindow):
         app.set_accels_for_action("win.mpv_seek_fwd", ["L", "l"])
         app.set_accels_for_action("win.mpv_speed_down", ["minus", "KP_Subtract"])
         app.set_accels_for_action("win.mpv_speed_up", ["equal", "KP_Add"])
+        app.set_accels_for_action("win.mpv_copy_ts", ["T", "t"])
         app.set_accels_for_action("win.stop_mpv", ["X", "x"])
 
     def _create_actions(self) -> None:
@@ -783,6 +807,7 @@ class MainWindow(Adw.ApplicationWindow):
             proc = start_mpv(video.url, extra_args=mpv_args, ipc_server_path=ipc_path)
             self._mpv_proc = proc
             self._mpv_ipc = ipc_path
+            self._mpv_current_url = video.url
             self._mpv_speed = 1.0
             self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
             # Enable stop action (and implicitly other mpv actions if desired)
@@ -806,6 +831,40 @@ class MainWindow(Adw.ApplicationWindow):
         self.ctrl_bar.set_visible(False)
         try: self._act_stop_mpv.set_enabled(False)
         except Exception: pass
+
+    def _mpv_copy_ts(self) -> None:
+        if not self._mpv_ipc:
+            return
+        # Ask mpv for current playback position
+        pos = 0
+        try:
+            resp = mpv_send_cmd(self._mpv_ipc, ["get_property", "time-pos"])
+            if isinstance(resp, dict) and "data" in resp:
+                v = resp.get("data")
+                if isinstance(v, (int, float)):
+                    pos = int(v)
+        except Exception:
+            pos = 0
+        url = self._mpv_current_url or ""
+        if not url:
+            # Try to get from MPV path property as fallback
+            try:
+                resp2 = mpv_send_cmd(self._mpv_ipc, ["get_property", "path"])
+                if isinstance(resp2, dict) and isinstance(resp2.get("data"), str):
+                    url = str(resp2["data"])
+            except Exception:
+                pass
+        if not url:
+            return
+        sep = "&" if "?" in url else "?"
+        stamped = f"{url}{sep}t={pos}s"
+        try:
+            disp = Gdk.Display.get_default()
+            if disp:
+                disp.get_clipboard().set_text(stamped)
+        except Exception:
+            pass
+        self._show_toast(f"Copied URL at {pos}s")
 
     def _is_mpv_controls_visible(self) -> bool:
         # Only show controls if MPV running

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.whirltube.WhirlTube</id>
+  <name>WhirlTube</name>
+  <summary>Lightweight GTK4 frontend for YouTube using mpv and yt-dlp</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>WhirlTube is a lightweight GTK4 frontend for YouTube that uses mpv for playback and yt-dlp for searching and downloading.</p>
+  </description>
+  <launchable type="desktop-id">org.whirltube.WhirlTube.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Network</category>
+  </categories>
+  <provides>
+    <binary>whirltube</binary>
+  </provides>
+  <url type="homepage">https://github.com/whirltube/whirltube</url>
+  <url type="bugtracker">https://github.com/whirltube/whirltube/issues</url>
+  <developer_name>WhirlTube contributors</developer_name>
+  <releases>
+    <release version="0.4.4">
+      <description>
+        <p>See CHANGELOG in repository.</p>
+      </description>
+    </release>
+  </releases>
+</component>
