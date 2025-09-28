@@ -7,7 +7,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import re
 
@@ -437,12 +437,12 @@ class MainWindow(Adw.ApplicationWindow):
         grp_play.append(Gtk.ShortcutsShortcut(title="Speed down", accelerator="-"))
         grp_play.append(Gtk.ShortcutsShortcut(title="Speed up", accelerator="="))
         grp_play.append(Gtk.ShortcutsShortcut(title="Stop", accelerator="X"))
-        # Assemble
-        sec.append(grp_nav)
-        sec.append(grp_app)
-        sec.append(grp_search)
-        sec.append(grp_play)
-        win.add(sec)
+        # Assemble: Add groups to section using add_group
+        sec.add_group(grp_nav)
+        sec.add_group(grp_app)
+        sec.add_group(grp_search)
+        sec.add_group(grp_play)
+        win.add_section(sec)
         win.present()
 
     def _on_about(self, *_args) -> None:
@@ -493,22 +493,23 @@ class MainWindow(Adw.ApplicationWindow):
         dlg.open(self, None, on_done, None)
 
     def _on_subs_export(self, *_a) -> None:
-        # Choose a folder, write subscriptions.json into it
-        dlg = Gtk.FileDialog(title="Choose export folder")
+        dlg = Gtk.FileDialog(title="Export subscriptions")
+        dlg.set_initial_name("subscriptions.json")
         def on_done(d, res, *_):
             try:
-                f = d.select_folder_finish(res)
+                f = d.save_finish(res)
             except Exception:
                 return
             path = f.get_path()
             if not path:
                 return
-            dest = Path(path) / "subscriptions.json"
+            dest = Path(path)
             try:
                 export_subscriptions(dest)
-            except Exception:
-                pass
-        dlg.select_folder(self, None, on_done, None)
+                self._show_toast(f"Exported {len(list_subscriptions())} subscriptions to {dest}")
+            except Exception as e:
+                self._show_error(f"Export failed: {e}")
+        dlg.save(self, None, on_done, None)
 
     def _on_preferences(self, *_a) -> None:
         win = PreferencesWindow(self, self.settings)
@@ -632,8 +633,8 @@ class MainWindow(Adw.ApplicationWindow):
                     return m.group(1)
             if host.endswith("youtube.com"):
                 if path.startswith("/watch"):
-                    qs: dict[str, list[str]] = dict([kv.split("=", 1)] for kv in (u.query or "").split("&") if "=" in kv)
-                    v = qs.get("v")
+                    qs = parse_qs(u.query or "")
+                    v = qs.get("v", [None])[0]
                     if v and re.fullmatch(r"[0-9A-Za-z_-]{11}", v):
                         return v
                 m = re.match(r"^/(?:shorts|embed)/([0-9A-Za-z_-]{11})", path)
