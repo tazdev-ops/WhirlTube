@@ -811,8 +811,10 @@ class MainWindow(Adw.ApplicationWindow):
             self._mpv_speed = 1.0
             self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
             # Enable stop action (and implicitly other mpv actions if desired)
-            try: self._act_stop_mpv.set_enabled(True)
-            except Exception: pass
+            try:
+                self._act_stop_mpv.set_enabled(True)
+            except Exception:
+                pass
 
             # Watcher thread: hide controls on exit
             def _watch():
@@ -829,8 +831,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._mpv_proc = None
         self._mpv_ipc = None
         self.ctrl_bar.set_visible(False)
-        try: self._act_stop_mpv.set_enabled(False)
-        except Exception: pass
+        try:
+            self._act_stop_mpv.set_enabled(False)
+        except Exception:
+            pass
 
     def _mpv_copy_ts(self) -> None:
         if not self._mpv_ipc:
