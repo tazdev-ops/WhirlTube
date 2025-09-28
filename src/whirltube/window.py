@@ -1333,21 +1333,12 @@ class ResultRow(Gtk.Box):
         # Try with proxy (if valid), then fallback without
         data: bytes | None = None
         try:
-            # For httpx 0.28.1, use proxy parameter for single proxy, or create custom transport
+            # For httpx 0.28.1+, use proxy parameter directly when _proxies is a string
             if self._proxies:
-                # Get the proxy URL (usually http://host:port format)
-                proxy_url = self._proxies.get('http') or self._proxies.get('https') or self._proxies.get('all')
-                if proxy_url:
-                    with httpx.Client(timeout=10.0, follow_redirects=True, proxy=proxy_url, headers=HEADERS) as client:
-                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r.raise_for_status()
-                        data = r.content
-                else:
-                    # No actual proxy URL, proceed without proxy
-                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
-                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r.raise_for_status()
-                        data = r.content
+                with httpx.Client(timeout=10.0, follow_redirects=True, proxy=self._proxies, headers=HEADERS) as client:
+                    r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                    r.raise_for_status()
+                    data = r.content
             else:
                 # No proxy configured
                 with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
@@ -1358,11 +1349,10 @@ class ResultRow(Gtk.Box):
             data = None
             # Fallback: retry without proxy if we had one
             try:
-                if self._proxies:
-                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client2:
-                        r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r2.raise_for_status()
-                        data = r2.content
+                with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client2:
+                    r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
+                    r2.raise_for_status()
+                    data = r2.content
             except Exception:
                 data = None
         if data is None:
