@@ -21,7 +21,7 @@ from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
 from .history import add_search_term, add_watch, list_watch
 from .models import Video
 from .mpv_embed import MpvWidget
-from .player import has_mpv, start_mpv, mpv_send_cmd
+from .player import has_mpv, start_mpv, mpv_send_cmd, mpv_supports_option
 from .provider import YTDLPProvider
 from .invidious_provider import InvidiousProvider
 from .download_manager import DownloadManager
@@ -374,6 +374,14 @@ class MainWindow(Adw.ApplicationWindow):
         prefs.connect("activate", self._on_preferences)
         self.add_action(prefs)
 
+        # Add the open URL action for Ctrl+L
+        open_url = Gio.SimpleAction.new("open_url", None)
+        open_url.connect("activate", self._on_open_url)
+        self.add_action(open_url)
+        app = self.get_application()
+        if app:
+            app.set_accels_for_action("win.open_url", ["<Primary>L"])
+
         shortcuts = Gio.SimpleAction.new("shortcuts", None)
         shortcuts.connect("activate", self._on_shortcuts)
         self.add_action(shortcuts)
@@ -428,6 +436,7 @@ class MainWindow(Adw.ApplicationWindow):
         grp_nav.append(Gtk.ShortcutsShortcut(title="Back", accelerator="<Primary>BackSpace"))
         # App group
         grp_app = Gtk.ShortcutsGroup(title="Application")
+        grp_app.append(Gtk.ShortcutsShortcut(title="Open URL", accelerator="<Primary>L"))
         grp_app.append(Gtk.ShortcutsShortcut(title="Quit", accelerator="<Primary>q"))
         # Search group
         grp_search = Gtk.ShortcutsGroup(title="Search")
@@ -826,11 +835,25 @@ class MainWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _play_video(self, video: Video) -> None:
+        # Log that the function was called to help with debugging
+        log.debug("_play_video called: url=%s", video.url)
         # Save to watch history
         add_watch(video)
 
         mode = self.settings.get("playback_mode", "external")
         mpv_args = self.settings.get("mpv_args", "") or ""
+        
+        # Detect Wayland/X11
+        session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+        is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+        log.debug("Play requested: url=%s mode=%s wayland=%s", video.url, mode, is_wayland)
+
+        # Embedded on Wayland? Fall back
+        if mode == "embedded" and is_wayland:
+            log.debug("Detected embedded mode on Wayland - falling back to external")
+            self._show_toast("In-window playback is X11-only. Using external player on Wayland.")
+            mode = "external"
+
         # Quality preset
         q = (self.settings.get("mpv_quality") or "auto").strip()
         if q and q != "auto":
@@ -847,41 +870,78 @@ class MainWindow(Adw.ApplicationWindow):
             if cookie_arg:
                 mpv_args = f"{mpv_args} {cookie_arg}".strip()
 
-        extra_platform_args = []
-        try:
-            # Robust backend detection
-            session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
-            is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+        # Add fullscreen option if enabled in settings
+        if bool(self.settings.get("mpv_fullscreen")):
+            mpv_args = f"{mpv_args} --fs".strip()
 
-            if is_wayland:
-                extra_platform_args.append(f"--wayland-app-id={APP_ID}")
-            else:
-                # Improve X11 mapping: set window name for grouping
-                extra_platform_args.append(f"--name={APP_ID}")
-        except Exception as e:
-            log.debug("Could not determine session type for mpv flags: %s", e)
+        extra_platform_args: list[str] = []
+        # Wayland grouping (if mpv supports it)
+        if is_wayland and mpv_supports_option("wayland-app-id"):
+            extra_platform_args.append(f"--wayland-app-id={APP_ID}")
+
+        # X11 grouping via WM_CLASS (if supported)
+        if not is_wayland and mpv_supports_option("class"):
+            # Sets WM_CLASS (X11); harmless on Wayland builds that accept it
+            extra_platform_args.append(f"--class={APP_ID}")
 
         final_mpv_args_list = shlex.split(mpv_args) + extra_platform_args
 
+        # Try embedded first only when actually allowed
         if mode == "embedded":
+            log.debug("Attempting embedded playback")
             ok = self.mpv_widget.play(video.url)
             if ok:
+                log.debug("Embedded playback started successfully")
                 self.navigation_controller.show_view("player")
                 return
+            else:
+                log.debug("Embedded playback failed, falling back to external")
+        else:
+            log.debug("Using external playback mode")
 
         if not has_mpv():
             self._show_error("MPV not found in PATH.")
             return
-        try:
-            # Unique IPC path per launch to avoid collisions
-            rnd = secrets.token_hex(4)
-            ipc_dir = Path(tempfile.gettempdir())
-            ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
 
+        # Proxy for mpv/yt-dlp
+        extra_env = {}
+        proxy = (self.settings.get("http_proxy") or "").strip()
+        if proxy:
+            extra_env["http_proxy"] = proxy
+            extra_env["https_proxy"] = proxy
+
+        # Unique IPC path per launch to avoid collisions
+        rnd = secrets.token_hex(4)
+        ipc_dir = Path(tempfile.gettempdir())
+        ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
+
+        # Optional: write mpv logs to /tmp when WHIRLTUBE_DEBUG=1
+        log_file = None
+        if os.environ.get("WHIRLTUBE_DEBUG"):
+            log_file = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.log")
+
+        log.debug("Launching mpv: args=%s proxy=%s", final_mpv_args_list, bool(proxy))
+        # Log the actual command being executed for debugging
+        mpv_cmd_parts = ["mpv", "--force-window=yes"] 
+        if ipc_path:
+            mpv_cmd_parts.append(f"--input-ipc-server={ipc_path}")
+        if log_file:
+            mpv_cmd_parts.extend(["--msg-level=all=v", f"--log-file={log_file}"])
+        mpv_cmd_parts.extend(final_mpv_args_list)
+        mpv_cmd_parts.append(video.url)
+        log.debug("MPV command: %s", " ".join(shlex.quote(arg) for arg in mpv_cmd_parts))
+        if os.environ.get("WHIRLTUBE_DEBUG"):
+            # Show a simplified command in the toast to avoid overwhelming the user
+            simplified_cmd = ["mpv"] + [arg for arg in final_mpv_args_list if not arg.startswith("--input-ipc-server") and not arg.startswith("--log-file")] + [video.url]
+            self._show_toast(f"Launching mpv: {' '.join(shlex.quote(arg) for arg in simplified_cmd)}")
+        
+        try:
             proc = start_mpv(
                 video.url,
                 extra_args=final_mpv_args_list,
                 ipc_server_path=ipc_path,
+                extra_env=extra_env,
+                log_file_path=log_file,
             )
 
             # Store for later cleanup and control
@@ -1149,10 +1209,30 @@ class ResultRow(Gtk.Box):
         self.set_margin_top(6)
         self.set_margin_bottom(6)
 
-        # Thumbnail
+        # Thumbnail stack with placeholder and image
+        self.thumb_stack = Gtk.Stack()
+        self.thumb_stack.set_size_request(160, 90)
+        
+        # Create placeholder widget once
+        self.thumb_placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.thumb_placeholder.set_size_request(160, 90)
+        self.thumb_placeholder.set_halign(Gtk.Align.FILL)
+        self.thumb_placeholder.set_valign(Gtk.Align.FILL)
+        lbl = Gtk.Label(label="No thumbnail")
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_valign(Gtk.Align.CENTER)
+        lbl.add_css_class("dim-label")
+        lbl.set_wrap(True)
+        self.thumb_placeholder.append(lbl)
+        
+        # Create picture widget once
         self.thumb = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
         self.thumb.set_size_request(160, 90)
-        self.append(self.thumb)
+        
+        # Add both to stack
+        self.thumb_stack.add_named(self.thumb_placeholder, "placeholder")
+        self.thumb_stack.add_named(self.thumb, "picture")
+        self.append(self.thumb_stack)
 
         # Texts
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
@@ -1333,6 +1413,8 @@ class ResultRow(Gtk.Box):
                     return
                 texture = Gdk.Texture.new_for_pixbuf(pixbuf)
                 self.thumb.set_paintable(texture)
+                # Show the picture in the stack
+                self.thumb_stack.set_visible_child_name("picture")
                 return
         except Exception:
             pass
@@ -1340,26 +1422,8 @@ class ResultRow(Gtk.Box):
         self._set_thumb_placeholder()
 
     def _set_thumb_placeholder(self) -> None:
-        try:
-            # Replace the picture with a placeholder box to keep consistent size
-            parent = self.thumb.get_parent()
-            if parent is not None:
-                parent.remove(self.thumb)
-        except Exception:
-            pass
-        ph = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        ph.set_size_request(160, 90)
-        ph.set_halign(Gtk.Align.FILL)
-        ph.set_valign(Gtk.Align.FILL)
-        lbl = Gtk.Label(label="No thumbnail")
-        # Center the placeholder label
-        lbl.set_halign(Gtk.Align.CENTER)
-        lbl.set_valign(Gtk.Align.CENTER)
-        lbl.add_css_class("dim-label")
-        lbl.set_wrap(True)
-        ph.append(lbl)
-        # Put the placeholder at the start (thumbnail slot)
-        self.prepend(ph)
+        # Show the placeholder in the stack
+        self.thumb_stack.set_visible_child_name("placeholder")
 
     def _open_in_browser(self) -> None:
         try:
