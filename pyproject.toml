@@ -47,6 +47,7 @@ include = [
   "ruff.toml",
   "tests/**",
   "data/**",
+  "flatpak/**",
 ]
 
 [tool.ruff]

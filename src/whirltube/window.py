@@ -65,6 +65,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("max_concurrent_downloads", 3)
         self.settings.setdefault("mpv_autohide_controls", False)
         self.settings.setdefault("download_template", "%(title)s.%(ext)s")
+        self.settings.setdefault("download_auto_open_folder", False)
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
         self.settings.setdefault("win_h", 740)
@@ -263,6 +264,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self.download_manager.set_download_dir(self.download_dir)
         self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
+        self.download_manager.restore_queued()
 
         self._create_actions()
         self._set_welcome()
@@ -533,6 +535,11 @@ class MainWindow(Adw.ApplicationWindow):
         # Persist current window size
         try:
             self.settings["win_w"], self.settings["win_h"] = int(self.get_width()), int(self.get_height())
+        except Exception:
+            pass
+        # Persist queue (best effort)
+        try:
+            self.download_manager.persist_queue()
         except Exception:
             pass
         save_settings(self.settings)

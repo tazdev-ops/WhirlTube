@@ -566,6 +566,13 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.download_button.connect("activated", self._choose_dir)
         group_dl.add(self.download_button)
 
+        # After completion
+        group_after = Adw.PreferencesGroup(title="After completion")
+        page_dl.add(group_after)
+        self.sw_auto_open = Adw.SwitchRow(title="Open download folder when a download finishes")
+        self.sw_auto_open.set_active(bool(settings.get("download_auto_open_folder", False)))
+        group_after.add(self.sw_auto_open)
+
         # Filename template
         self.entry_template = Adw.EntryRow(title="Filename template")
         self.entry_template.set_text(settings.get("download_template", "%(title)s.%(ext)s"))
@@ -635,5 +642,7 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.settings["invidious_instance"] = self.entry_invidious.get_text().strip() or "https://yewtu.be"
         # Auto-hide MPV controls
         self.settings["mpv_autohide_controls"] = bool(self.autohide_controls.get_active())
+        # After completion + template
+        self.settings["download_auto_open_folder"] = bool(self.sw_auto_open.get_active())
         self.settings["download_template"] = self.entry_template.get_text().strip() or "%(title)s.%(ext)s"
         return False

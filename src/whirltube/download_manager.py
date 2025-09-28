@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 from functools import partial
 from copy import deepcopy
+from dataclasses import asdict
 
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import GLib, Gio, Gtk
+from gi.repository import GLib, Gdk, Gio, Gtk
 
 from .downloader import DownloadProgress, DownloadTask, RunnerDownloadTask
 from .models import Video
 from .dialogs import DownloadOptions
 from .download_history import add_download
+from .util import xdg_data_dir
 
 log = logging.getLogger(__name__)
+
+_QUEUE_FILE = xdg_data_dir() / "download_queue.json"
 
 def _notify(summary: str) -> None:
     # Best-effort desktop notification without requiring GI at import time.
@@ -71,9 +77,11 @@ class DownloadRow(Gtk.Box):
         self._btn_m_open_folder.connect("clicked", self._open_folder)
         self._btn_m_show_containing = Gtk.Button(label="Show in folder")
         self._btn_m_show_containing.connect("clicked", self._show_in_folder)
+        self._btn_m_copy_path = Gtk.Button(label="Copy file path")
+        self._btn_m_copy_path.connect("clicked", self._copy_path)
         self._btn_m_open_file = Gtk.Button(label="Open file")
         self._btn_m_open_file.connect("clicked", self._open_file)
-        for b in (self._btn_m_cancel, self._btn_m_retry, self._btn_m_remove, self._btn_m_open_folder, self._btn_m_show_containing, self._btn_m_open_file):
+        for b in (self._btn_m_cancel, self._btn_m_retry, self._btn_m_remove, self._btn_m_open_folder, self._btn_m_show_containing, self._btn_m_copy_path, self._btn_m_open_file):
             vbox.append(b)
         pop.set_child(vbox)
         self.menu_btn.set_popover(pop)
@@ -159,6 +167,7 @@ class DownloadRow(Gtk.Box):
             self._btn_m_open_folder.set_sensitive(True)
             self._btn_m_open_file.set_sensitive(True)
             self._btn_m_show_containing.set_sensitive(True)
+            self._btn_m_copy_path.set_sensitive(True)
             self._state = "finished"
         elif p.status == "error":
             # Disable cancel after error
@@ -167,6 +176,8 @@ class DownloadRow(Gtk.Box):
             self._btn_m_remove.set_sensitive(True)
             self._btn_m_open_folder.set_sensitive(True)
             self._btn_m_show_containing.set_sensitive(True)
+            # Copy path and open file may still not be resolvable; keep conservative
+            self._btn_m_copy_path.set_sensitive(False)
             self._state = "error"
 
     def _open_folder(self, *_a) -> None:
@@ -202,6 +213,7 @@ class DownloadRow(Gtk.Box):
             self._btn_m_remove.set_sensitive(True)
             self._btn_m_open_folder.set_sensitive(True)
             self._btn_m_show_containing.set_sensitive(True)
+            self._btn_m_copy_path.set_sensitive(False)
             self._state = "cancelled"
         except Exception:
             pass
@@ -218,6 +230,30 @@ class DownloadRow(Gtk.Box):
                 parent = fp.parent
                 if parent.exists():
                     Gio.AppInfo.launch_default_for_uri(f"file://{parent}", None)
+        except Exception:
+            pass
+
+    def _copy_path(self, *_a) -> None:
+        try:
+            p: DownloadProgress = getattr(self.task, "progress", None)
+            dest: Path = getattr(self.task, "dest_dir", None)
+            if p and p.filename:
+                fp = Path(p.filename)
+                if not fp.is_absolute() and isinstance(dest, Path):
+                    fp = dest / fp
+                disp = Gdk.Display.get_default()
+                if disp:
+                    disp.get_clipboard().set_text(str(fp))
+                return
+        except Exception:
+            pass
+        # Fallback: copy dest_dir
+        try:
+            disp = Gdk.Display.get_default()
+            if disp:
+                dest: Path = getattr(self.task, "dest_dir", None)
+                if isinstance(dest, Path):
+                    disp.get_clipboard().set_text(str(dest))
         except Exception:
             pass
 
@@ -262,6 +298,8 @@ class DownloadManager:
         # queue of (video, opts, dest_dir, row)
         self._queue: list[tuple[Video, DownloadOptions, Path, DownloadRow]] = []
         self._rows: list[DownloadRow] = []
+        # persistent queue path
+        self._queue_path: Path = _QUEUE_FILE
 
     def set_download_dir(self, path: Path) -> None:
         self.download_dir = path
@@ -298,12 +336,14 @@ class DownloadManager:
         self.show_downloads_view()
         # Enqueue and attempt to start
         self._queue.append((video, opts, dest_dir, row))
+        self._persist_queue()
         self._maybe_start_next()
 
     def _maybe_start_next(self) -> None:
         # Start as many as allowed
         while self._active < self._max_concurrent and self._queue:
             video, opts, dest_dir, row = self._queue.pop(0)
+            self._persist_queue()
             self._start_task(video, opts, dest_dir, row)
 
     def _cancel_row(self, row: DownloadRow | None) -> None:
@@ -318,6 +358,7 @@ class DownloadManager:
                 except Exception:
                     pass
                 row.mark_cancelled()
+                self._persist_queue()
                 return
         # If running: try to stop the task
         task = getattr(row, "task", None)
@@ -383,6 +424,14 @@ class DownloadManager:
             if row.state() == "downloading":
                 self._cancel_row(row)
 
+    @staticmethod
+    def _open_folder(path: Path) -> None:
+        try:
+            if isinstance(path, Path) and path.exists():
+                Gio.AppInfo.launch_default_for_uri(f"file://{path}", None)
+        except Exception:
+            pass
+
     def clear_finished(self) -> None:
         # Remove rows that are done (finished, cancelled, error)
         for row in list(self._rows):
@@ -425,6 +474,12 @@ class DownloadManager:
                                 pass
                             self.show_toast(f"Downloaded: {video.title}")
                             _notify(f"Downloaded: {video.title}")
+                            # Auto-open download folder if enabled
+                            try:
+                                if bool(self.get_setting("download_auto_open_folder")):
+                                    self._open_folder(dest_dir)
+                            except Exception:
+                                pass
                         elif p.status == "error":
                             self.show_toast(f"Download failed: {video.title}")
                             _notify(f"Download failed: {video.title}")
@@ -464,3 +519,77 @@ class DownloadManager:
         row._on_cancel = lambda: self._cancel_row(row)  # type: ignore[attr-defined]
         dl_task.start(_on_update)
         return
+
+    def persist_queue(self) -> None:
+        """Public: persist current queued items to disk."""
+        self._persist_queue()
+
+    def _persist_queue(self) -> None:
+        """Write only queued items (not running) to a JSON file."""
+        try:
+            items = []
+            for v, o, d, r in self._queue:
+                # Serialize dataclasses; avoid Path in opts to keep JSON simple
+                vd = asdict(v)
+                od = asdict(o)
+                od.pop("target_dir", None)
+                items.append(
+                    {
+                        "video": vd,
+                        "opts": od,
+                        "dest_dir": str(d),
+                        "title": v.title,
+                    }
+                )
+            self._queue_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._queue_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._queue_path)
+        except Exception:
+            pass
+
+    def restore_queued(self) -> None:
+        """Restore queued items from disk and enqueue them."""
+        p = self._queue_path
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return
+        except Exception:
+            return
+        for it in data:
+            try:
+                if not isinstance(it, dict):
+                    continue
+                vraw = it.get("video") or {}
+                oraw = it.get("opts") or {}
+                dstr = it.get("dest_dir") or ""
+                if not isinstance(vraw, dict) or not isinstance(oraw, dict) or not isinstance(dstr, str):
+                    continue
+                video = Video(
+                    id=str(vraw.get("id") or ""),
+                    title=vraw.get("title") or "",
+                    url=vraw.get("url") or "",
+                    channel=vraw.get("channel"),
+                    duration=vraw.get("duration"),
+                    thumb_url=vraw.get("thumb_url"),
+                    kind=vraw.get("kind") or "video",
+                )
+                opts = DownloadOptions(**oraw)
+                dest_dir = Path(dstr)
+                # Create row in UI as queued and put into _queue
+                row = DownloadRow(None, title=video.title, on_cancel=partial(self._cancel_row, None), on_retry=partial(self._retry_row, None), on_remove=partial(self._remove_row, None))
+                row._on_cancel = partial(self._cancel_row, row)  # type: ignore[attr-defined]
+                row._on_retry = partial(self._retry_row, row)  # type: ignore[attr-defined]
+                row._on_remove = partial(self._remove_row, row)  # type: ignore[attr-defined]
+                row.set_metadata(video, opts, dest_dir)
+                row.set_queued()
+                self.downloads_box.append(row)
+                self._rows.append(row)
+                self._queue.append((video, opts, dest_dir, row))
+            except Exception:
+                continue
+        # Kick off any that fit concurrency
+        self._maybe_start_next()
