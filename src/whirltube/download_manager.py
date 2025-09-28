@@ -424,8 +424,10 @@ class DownloadManager:
                             except Exception:
                                 pass
                             self.show_toast(f"Downloaded: {video.title}")
+                            _notify(f"Downloaded: {video.title}")
                         elif p.status == "error":
                             self.show_toast(f"Download failed: {video.title}")
+                            _notify(f"Download failed: {video.title}")
                     finally:
                         self._active = max(0, self._active - 1)
                         self._maybe_start_next()

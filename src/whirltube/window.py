@@ -128,6 +128,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Download History", "win.download_history")
         menu.append("Cancel All Downloads", "win.cancel_all_downloads")
         menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
+        menu.append("Stop MPV", "win.stop_mpv")
         menu.append("Quit", "app.quit")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_btn.set_menu_model(menu)
@@ -212,11 +213,23 @@ class MainWindow(Adw.ApplicationWindow):
         self.stack.add_titled(results_scroll, "results", "Results")
 
         # Downloads
+        downloads_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._set_margins(downloads_page, 8)
+        # Header row with "Open download directory"
+        dl_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_open_dl_dir = Gtk.Button(label="Open download directory")
+        self.btn_open_dl_dir.set_tooltip_text("Open current download directory")
+        self.btn_open_dl_dir.connect("clicked", self._open_download_dir)
+        dl_hdr.append(self.btn_open_dl_dir)
+        dl_hdr.append(Gtk.Label(label="", hexpand=True))  # spacer
+        downloads_page.append(dl_hdr)
+        # Scroll with list
         self.downloads_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self._set_margins(self.downloads_box, 8)
         downloads_scroll = Gtk.ScrolledWindow(vexpand=True)
         downloads_scroll.set_child(self.downloads_box)
-        self.stack.add_titled(downloads_scroll, "downloads", "Downloads")
+        downloads_page.append(downloads_scroll)
+        # Add as stack page
+        self.stack.add_titled(downloads_page, "downloads", "Downloads")
 
         # Player (embedded mpv)
         self.player_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -245,6 +258,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_welcome()
         self._install_shortcuts()
 
+        # MPV actions (menu + hotkeys)
+        self._install_mpv_actions()
+
         # MPV external player state
         self._mpv_proc = None
         self._mpv_ipc = None
@@ -272,6 +288,46 @@ class MainWindow(Adw.ApplicationWindow):
         w.set_margin_bottom(px)
         w.set_margin_start(px)
         w.set_margin_end(px)
+
+    def _install_mpv_actions(self) -> None:
+        # Define actions
+        a_play_pause = Gio.SimpleAction.new("mpv_play_pause", None)
+        a_play_pause.connect("activate", lambda *_: self._mpv_cycle_pause())
+        self.add_action(a_play_pause)
+
+        a_seek_back = Gio.SimpleAction.new("mpv_seek_back", None)
+        a_seek_back.connect("activate", lambda *_: self._mpv_seek(-10))
+        self.add_action(a_seek_back)
+
+        a_seek_fwd = Gio.SimpleAction.new("mpv_seek_fwd", None)
+        a_seek_fwd.connect("activate", lambda *_: self._mpv_seek(10))
+        self.add_action(a_seek_fwd)
+
+        a_speed_down = Gio.SimpleAction.new("mpv_speed_down", None)
+        a_speed_down.connect("activate", lambda *_: self._mpv_speed_delta(-0.1))
+        self.add_action(a_speed_down)
+
+        a_speed_up = Gio.SimpleAction.new("mpv_speed_up", None)
+        a_speed_up.connect("activate", lambda *_: self._mpv_speed_delta(0.1))
+        self.add_action(a_speed_up)
+
+        a_stop = Gio.SimpleAction.new("stop_mpv", None)
+        a_stop.connect("activate", lambda *_: self._mpv_stop())
+        a_stop.set_enabled(False)  # only enabled when mpv running
+        self.add_action(a_stop)
+        self._act_stop_mpv = a_stop
+
+        # Install accelerators
+        app = self.get_application()
+        if not app:
+            return
+        # YouTube-like keys: j/k/l and +/- for speed, x to stop
+        app.set_accels_for_action("win.mpv_play_pause", ["K", "k"])
+        app.set_accels_for_action("win.mpv_seek_back", ["J", "j"])
+        app.set_accels_for_action("win.mpv_seek_fwd", ["L", "l"])
+        app.set_accels_for_action("win.mpv_speed_down", ["minus", "KP_Subtract"])
+        app.set_accels_for_action("win.mpv_speed_up", ["equal", "KP_Add"])
+        app.set_accels_for_action("win.stop_mpv", ["X", "x"])
 
     def _create_actions(self) -> None:
         about = Gio.SimpleAction.new("about", None)
@@ -339,13 +395,14 @@ class MainWindow(Adw.ApplicationWindow):
         # Search group
         grp_search = Gtk.ShortcutsGroup(title="Search")
         grp_search.append(Gtk.ShortcutsShortcut(title="Run search", accelerator="Return"))
-        # Player/MPV controls (external; via control bar)
-        grp_play = Gtk.ShortcutsGroup(title="MPV Controls (when visible)")
-        grp_play.append(Gtk.ShortcutsShortcut(title="Seek backward 10s", accelerator="button"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Play/Pause", accelerator="button"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Seek forward 10s", accelerator="button"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Speed - / +", accelerator="button"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Stop", accelerator="button"))
+        # Player/MPV controls
+        grp_play = Gtk.ShortcutsGroup(title="MPV Controls")
+        grp_play.append(Gtk.ShortcutsShortcut(title="Play/Pause", accelerator="K"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Seek backward 10s", accelerator="J"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Seek forward 10s", accelerator="L"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Speed down", accelerator="-"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Speed up", accelerator="="))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Stop", accelerator="X"))
         # Assemble
         sec.append(grp_nav)
         sec.append(grp_app)
@@ -728,6 +785,9 @@ class MainWindow(Adw.ApplicationWindow):
             self._mpv_ipc = ipc_path
             self._mpv_speed = 1.0
             self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+            # Enable stop action (and implicitly other mpv actions if desired)
+            try: self._act_stop_mpv.set_enabled(True)
+            except Exception: pass
 
             # Watcher thread: hide controls on exit
             def _watch():
@@ -744,6 +804,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._mpv_proc = None
         self._mpv_ipc = None
         self.ctrl_bar.set_visible(False)
+        try: self._act_stop_mpv.set_enabled(False)
+        except Exception: pass
 
     def _is_mpv_controls_visible(self) -> bool:
         # Only show controls if MPV running
@@ -878,6 +940,14 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _show_downloads(self, *_args) -> None:
         self.navigation_controller.show_view("downloads")
+
+    def _open_download_dir(self, *_a) -> None:
+        try:
+            p = self.download_dir
+            if isinstance(p, Path):
+                Gio.AppInfo.launch_default_for_uri(f"file://{p}", None)
+        except Exception:
+            pass
 
 
 class ResultRow(Gtk.Box):
