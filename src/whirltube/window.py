@@ -1218,10 +1218,27 @@ class ResultRow(Gtk.Box):
         # Try with proxy (if valid), then fallback without
         data: bytes | None = None
         try:
-            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies, headers=HEADERS) as client:
-                r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                r.raise_for_status()
-                data = r.content
+            # For httpx 0.28.1, use proxy parameter for single proxy, or create custom transport
+            if self._proxies:
+                # Get the proxy URL (usually http://host:port format)
+                proxy_url = self._proxies.get('http') or self._proxies.get('https') or self._proxies.get('all')
+                if proxy_url:
+                    with httpx.Client(timeout=10.0, follow_redirects=True, proxy=proxy_url, headers=HEADERS) as client:
+                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                        r.raise_for_status()
+                        data = r.content
+                else:
+                    # No actual proxy URL, proceed without proxy
+                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
+                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                        r.raise_for_status()
+                        data = r.content
+            else:
+                # No proxy configured
+                with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
+                    r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
+                    r.raise_for_status()
+                    data = r.content
         except Exception:
             data = None
             # Fallback: retry without proxy if we had one
@@ -1239,11 +1256,41 @@ class ResultRow(Gtk.Box):
         GLib.idle_add(self._set_thumb, data)
 
     def _set_thumb(self, data: bytes) -> None:
-        loader = GdkPixbuf.PixbufLoader()
+        # Check content type and convert WebP to JPEG if needed
         try:
+            # First try to load directly
+            loader = GdkPixbuf.PixbufLoader()
             loader.write(data)
             loader.close()
             pixbuf = loader.get_pixbuf()
+            
+            if pixbuf is None:
+                # If direct load fails, try to detect content type
+                if data.startswith(b'RIFF') and b'WEBP' in data[:12]:
+                    # This is a WebP image, try to convert it
+                    import io
+                    try:
+                        from PIL import Image
+                        img = Image.open(io.BytesIO(data))
+                        # Convert WebP to JPEG in memory
+                        output = io.BytesIO()
+                        img.convert('RGB').save(output, format='JPEG')
+                        jpeg_data = output.getvalue()
+                        
+                        # Now load the JPEG
+                        loader2 = GdkPixbuf.PixbufLoader()
+                        loader2.write(jpeg_data)
+                        loader2.close()
+                        pixbuf = loader2.get_pixbuf()
+                    except ImportError:
+                        # PIL not available, show placeholder
+                        self._set_thumb_placeholder()
+                        return
+                    except Exception:
+                        # Conversion failed, show placeholder
+                        self._set_thumb_placeholder()
+                        return
+            
             if pixbuf:
                 # Check for tiny placeholder images (e.g. 1x1)
                 if pixbuf.get_width() < 10 or pixbuf.get_height() < 10:
@@ -1322,6 +1369,7 @@ def _fmt_meta(v: Video) -> str:
     if v.kind in ("playlist", "channel"):
         return f"{base} • {v.kind}"
     return base
+
 
 def _spacer(px: int) -> Gtk.Box:
     b = Gtk.Box()
