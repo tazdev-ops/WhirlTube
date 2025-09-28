@@ -69,7 +69,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.settings.setdefault("max_concurrent_downloads", 3)
         self.settings.setdefault("mpv_autohide_controls", False)
-        self.settings.setdefault("download_template", "% (title)s.%(ext)s")
+        self.settings.setdefault("download_template", "%(title)s.%(ext)s")
         self.settings.setdefault("download_auto_open_folder", False)
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
@@ -86,7 +86,6 @@ class MainWindow(Adw.ApplicationWindow):
         
         # ToolbarView
         self.toolbar_view = Adw.ToolbarView()
-        self.set_content(self.toolbar_view)
         
         # Header
         header = Adw.HeaderBar()
@@ -1166,18 +1165,23 @@ class ResultRow(Gtk.Box):
             open_btn.set_tooltip_text("Open this playlist/channel")
             open_btn.connect("clicked", lambda *_: self.on_open(self.video))
             btn_box.append(open_btn)
+
+            dl_btn = Gtk.Button(label="Download…")
+            dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
+            btn_box.append(dl_btn)
+
             if self.video.kind == "channel":
                 label = "Unfollow" if self._followed else "Follow"
                 follow_btn = Gtk.Button(label=label)
                 def _toggle_follow(_btn):
                     try:
                         if self._followed:
-                            if self.on_unfollow: 
+                            if self.on_unfollow:
                                 self.on_unfollow(self.video)
                             self._followed = False
                             _btn.set_label("Follow")
                         else:
-                            if self.on_follow: 
+                            if self.on_follow:
                                 self.on_follow(self.video)
                             self._followed = True
                             _btn.set_label("Unfollow")

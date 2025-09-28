@@ -156,7 +156,7 @@ class DownloadOptionsWindow(Adw.Window):
         self.set_default_size(600, 700)
 
         root = Adw.ToolbarView()
-        self.set_child(root)
+        self.set_content(root)
         header = Adw.HeaderBar()
         root.add_top_bar(header)
 
