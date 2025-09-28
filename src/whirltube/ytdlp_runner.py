@@ -40,6 +40,8 @@ def parse_line(line: str) -> list[ProgressEvent] | Exception | None:
         return RuntimeError(line[len("stderr:ERROR: ") :].strip())
     if line.startswith("ERROR: "):
         return RuntimeError(line[len("ERROR: ") :].strip())
+    if line.startswith("stderr:") and PREFIX not in line:
+        return RuntimeError(f"yt-dlp error: {line[8:].strip()}")
     idx = line.find(PREFIX)
     if idx < 0:
         return None

@@ -7,10 +7,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from .util import load_settings, save_settings
-from .ytdlp_runner import YtDlpRunner, parse_line
+from .util import load_settings, save_settings  # noqa: E402
+from .ytdlp_runner import YtDlpRunner, parse_line  # noqa: E402
 
 
 def _notify(summary: str) -> None:
@@ -260,9 +260,9 @@ class QuickDownloadWindow(Gtk.Window):
         # sponsorblock
         sb_idx = self.dd_sb.get_selected()
         if sb_idx == 1:
-            args += ["--sponsorblock-mark=default"]
+            args += ["--sponsorblock-mark", "default"]
         elif sb_idx == 2:
-            args += ["--sponsorblock-remove=default"]
+            args += ["--sponsorblock-remove", "default"]
 
         # playlist mode
         if self.chk_playlist.get_active():
