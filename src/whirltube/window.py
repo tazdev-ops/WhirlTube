@@ -3,20 +3,15 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from urllib.parse import urlparse
 from pathlib import Path
+import re
 
-import gi
 import httpx
-
-gi.require_version("Gtk", "4.0")
-gi.require_version("Adw", "1")
-gi.require_version("Gdk", "4.0")
-gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 from . import __version__
 from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
@@ -34,13 +29,24 @@ from .subscriptions import is_followed, add_subscription, remove_subscription, l
 from .quickdownload import QuickDownloadWindow
 from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy, is_valid_youtube_url
 
+import gi
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+
 log = logging.getLogger(__name__)
 
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app, title="WhirlTube")
-        # Use persisted window size
+        # Load settings first, then apply persisted window size
+        self.settings = load_settings()
         try:
             w = int(self.settings.get("win_w") or 1080)
             h = int(self.settings.get("win_h") or 740)
@@ -49,7 +55,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_default_size(w, h)
         self.set_icon_name("whirltube")
 
-        self.settings = load_settings()
         self.download_dir = Path(self.settings.get("download_dir") or str(xdg_data_dir() / "downloads"))
         self.settings.setdefault("playback_mode", "external")  # external | embedded
         self.settings.setdefault("mpv_args", "")
@@ -64,7 +69,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.settings.setdefault("max_concurrent_downloads", 3)
         self.settings.setdefault("mpv_autohide_controls", False)
-        self.settings.setdefault("download_template", "%(title)s.%(ext)s")
+        self.settings.setdefault("download_template", "% (title)s.%(ext)s")
         self.settings.setdefault("download_auto_open_folder", False)
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
@@ -73,20 +78,20 @@ class MainWindow(Adw.ApplicationWindow):
         proxy = (self.settings.get("http_proxy") or "").strip() or None
         if bool(self.settings.get("use_invidious")):
             base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
-            self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+            self.provider: YTDLPProvider | InvidiousProvider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
         else:
-            self.provider = YTDLPProvider(proxy or None)
+            self.provider: YTDLPProvider | InvidiousProvider = YTDLPProvider(proxy or None)
         self._search_generation = 0
         self._thumb_loader_pool = ThreadPoolExecutor(max_workers=4)
-
+        
         # ToolbarView
         self.toolbar_view = Adw.ToolbarView()
         self.set_content(self.toolbar_view)
-
+        
         # Header
         header = Adw.HeaderBar()
         self.toolbar_view.add_top_bar(header)
-
+        
         # MPV control bar (hidden by default; shown for external MPV)
         self.ctrl_bar = Adw.HeaderBar()
         self.ctrl_bar.set_title_widget(Gtk.Label(label="MPV Controls", css_classes=["dim-label"]))
@@ -119,12 +124,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.ctrl_bar.pack_end(self.btn_seek_back)
         self.toolbar_view.add_top_bar(self.ctrl_bar)
         self.ctrl_bar.set_visible(False)
-
+        
         # Back button (NavigationController will connect it)
         self.btn_back = Gtk.Button(icon_name="go-previous-symbolic")
         self.btn_back.set_tooltip_text("Back")
         header.pack_start(self.btn_back)
-
+        
         # Menu
         menu = Gio.Menu()
         menu.append("Preferences", "win.preferences")
@@ -142,7 +147,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_btn.set_menu_model(menu)
         header.pack_start(menu_btn)
-
+        
         # Quick actions (left)
         self.btn_open = Gtk.Button(label="Open URL…")
         self.btn_open.set_tooltip_text("Open any YouTube URL (video/playlist/channel)")
@@ -169,7 +174,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.search.set_placeholder_text("Search YouTube…")
         header.set_title_widget(self.search)
         self.search.connect("activate", self._on_search_activate)
-
+        
         # Filters popover
         self.btn_filters = Gtk.MenuButton(icon_name="view-list-symbolic")
         self.btn_filters.set_tooltip_text("Search filters")
@@ -201,7 +206,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._filters_load_from_settings()
         btn_clear.connect("clicked", self._filters_clear)
         btn_apply.connect("clicked", self._filters_apply)
-
+        
         # Downloads toggle
         self.downloads_button = Gtk.Button(label="Downloads")
         self.downloads_button.connect("clicked", self._show_downloads)
@@ -213,7 +218,7 @@ class MainWindow(Adw.ApplicationWindow):
             hexpand=True,
             transition_type=Gtk.StackTransitionType.CROSSFADE,
         )
-
+        
         # Results
         self.results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self._set_margins(self.results_box, 8)
@@ -250,6 +255,12 @@ class MainWindow(Adw.ApplicationWindow):
         # Place ToolbarView inside the ToastOverlay
         self.toast_overlay.set_child(self.toolbar_view)
         self.toolbar_view.set_content(self.stack)
+        
+        # Track stack page changes once (for MPV controls visibility)
+        try:
+            self.stack.connect("notify::visible-child", self._on_stack_changed)
+        except Exception:
+            pass
 
         # Navigation controller (handles back button)
         self.navigation_controller = NavigationController(self.stack, self.btn_back)
@@ -277,20 +288,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._mpv_current_url: str | None = None
 
         # MPV external player state
-        self._mpv_proc = None
-        self._mpv_ipc = None
+        self._mpv_proc: subprocess.Popen | None = None
+        self._mpv_ipc: str | None = None
         self._mpv_speed = 1.0
 
         # Save settings on window close
         self.connect("close-request", self._on_main_close)
-
     def _show_toast(self, text: str) -> None:
         try:
             self.toast_overlay.add_toast(Adw.Toast.new(text))
         except Exception:
             pass
-        # React to stack page changes for MPV controls visibility
-        self.stack.connect("notify::visible-child", self._on_stack_changed)
 
     def _install_shortcuts(self) -> None:
         # Add a "go-back" action with common shortcuts.
@@ -391,6 +399,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         subs_export = Gio.SimpleAction.new("subs_export", None)
         subs_export.connect("activate", self._on_subs_export)
+        self.add_action(subs_export)
 
     def _show_loading(self, message: str) -> None:
         # Clear results and show a centered spinner + message
@@ -593,11 +602,47 @@ class MainWindow(Adw.ApplicationWindow):
                         if not is_valid_youtube_url(url, extra):
                             self._show_error("This doesn't look like a YouTube/Invidious URL.")
                         else:
-                            self._browse_url(url)
+                            # If this looks like a direct video URL, play immediately
+                            vid = self._extract_ytid_from_url(url)
+                            if vid:
+                                v = Video(id=vid, title=url, url=url, channel=None, duration=None, thumb_url=None, kind="video")
+                                self._play_video(v)
+                            else:
+                                # Otherwise open as a listing (playlist/channel/etc.)
+                                self._browse_url(url)
             finally:
                 d.destroy()
 
         dlg.connect("response", on_response)
+
+    def _extract_ytid_from_url(self, url: str) -> str | None:
+        """
+        Extract a YouTube video ID from common URL forms:
+        - https://www.youtube.com/watch?v=ID
+        - https://youtu.be/ID
+        - https://www.youtube.com/shorts/ID
+        - https://www.youtube.com/embed/ID
+        """
+        try:
+            u = urlparse(url)
+            host = (u.hostname or "").lower()
+            path = u.path or ""
+            if host == "youtu.be":
+                m = re.match(r"^/([0-9A-Za-z_-]{11})", path)
+                if m:
+                    return m.group(1)
+            if host.endswith("youtube.com"):
+                if path.startswith("/watch"):
+                    qs: dict[str, list[str]] = dict([kv.split("=", 1)] for kv in (u.query or "").split("&") if "=" in kv)
+                    v = qs.get("v")
+                    if v and re.fullmatch(r"[0-9A-Za-z_-]{11}", v):
+                        return v
+                m = re.match(r"^/(?:shorts|embed)/([0-9A-Za-z_-]{11})", path)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        return None
 
     def _on_history(self, *_a) -> None:
         vids = list_watch(limit=200)
@@ -610,6 +655,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_feed(self, *_a) -> None:
         # Show loading, then fetch recent uploads from each followed channel
         self._show_loading("Loading feed…")
+
         def worker():
             vids_all = []
             try:
@@ -973,6 +1019,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings["search_order"] = ord_map.get(self.dd_order.get_selected(), "relevance")
         save_settings(self.settings)
         self._filters_pop.popdown()
+        # If there is a current query, re-run search with new filters
+        try:
+            q = (self.search.get_text() or "").strip()
+            if q:
+                self._run_search(q)
+        except Exception:
+            pass
 
     def _filters_clear(self, *_a) -> None:
         self.settings["search_duration"] = "any"
@@ -980,6 +1033,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings["search_order"] = "relevance"
         save_settings(self.settings)
         self._filters_load_from_settings()
+        # Optionally re-run current search after clearing
+        try:
+            q = (self.search.get_text() or "").strip()
+            if q:
+                self._run_search(q)
+        except Exception:
+            pass
 
     # ---------- Downloads ----------
 
@@ -1015,7 +1075,7 @@ class MainWindow(Adw.ApplicationWindow):
         try:
             p = self.download_dir
             if isinstance(p, Path):
-                Gio.AppInfo.launch_default_for_uri(f"file://{p}", None)
+                Gio.AppInfo.launch_default_for_uri(p.as_uri(), None)
         except Exception:
             pass
 
@@ -1076,18 +1136,30 @@ class ResultRow(Gtk.Box):
             play_btn.connect("clicked", lambda *_: self.on_play(self.video))
             dl_btn = Gtk.Button(label="Download…")
             dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
-            rel_btn = Gtk.Button(label="Related")
-            rel_btn.connect("clicked", lambda *_: self.on_related(self.video))
-            cmt_btn = Gtk.Button(label="Comments")
-            cmt_btn.connect("clicked", lambda *_: self.on_comments(self.video))
-            ch_btn = Gtk.Button(label="Open channel")
-            ch_btn.set_tooltip_text("Open the uploader's channel")
-            ch_btn.connect("clicked", lambda *_: self.on_open_channel(self.video))
             btn_box.append(play_btn)
             btn_box.append(dl_btn)
-            btn_box.append(rel_btn)
-            btn_box.append(cmt_btn)
-            btn_box.append(ch_btn)
+            # Compact "More…" menu
+            more = Gtk.MenuButton(label="More…")
+            pop = Gtk.Popover()
+            vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            b_rel = Gtk.Button(label="Related")
+            b_rel.connect("clicked", lambda *_: self.on_related(self.video))
+            b_cmt = Gtk.Button(label="Comments")
+            b_cmt.connect("clicked", lambda *_: self.on_comments(self.video))
+            b_ch = Gtk.Button(label="Open channel")
+            b_ch.set_tooltip_text("Open the uploader's channel")
+            b_ch.connect("clicked", lambda *_: self.on_open_channel(self.video))
+            b_web = Gtk.Button(label="Open in Browser")
+            b_web.connect("clicked", lambda *_: self._open_in_browser())
+            b_cu = Gtk.Button(label="Copy URL")
+            b_cu.connect("clicked", lambda *_: self._copy_url())
+            b_ct = Gtk.Button(label="Copy Title")
+            b_ct.connect("clicked", lambda *_: self._copy_title())
+            for b in (b_rel, b_cmt, b_ch, b_web, b_cu, b_ct):
+                vbx.append(b)
+            pop.set_child(vbx)
+            more.set_popover(pop)
+            btn_box.append(more)
         else:
             # Non-playable: show Open; if channel, also Follow/Unfollow
             open_btn = Gtk.Button(label="Open")
@@ -1113,19 +1185,21 @@ class ResultRow(Gtk.Box):
                         pass
                 follow_btn.connect("clicked", _toggle_follow)
                 btn_box.append(follow_btn)
-        # Common actions: open in browser, copy URL
-        open_web = Gtk.Button(label="Open in Browser")
-        open_web.connect("clicked", lambda *_: self._open_in_browser())
-        copy_url = Gtk.Button(label="Copy URL")
-        copy_url.connect("clicked", lambda *_: self._copy_url())
-        copy_title = Gtk.Button(label="Copy Title")
-        copy_title.connect("clicked", lambda *_: self._copy_title())
-        # Add spacing between common actions group and primary actions
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        btn_box.append(sep)
-        btn_box.append(open_web)
-        btn_box.append(copy_url)
-        btn_box.append(copy_title)
+            # Compact "More…" for common actions
+            more = Gtk.MenuButton(label="More…")
+            pop = Gtk.Popover()
+            vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            b_web = Gtk.Button(label="Open in Browser")
+            b_web.connect("clicked", lambda *_: self._open_in_browser())
+            b_cu = Gtk.Button(label="Copy URL")
+            b_cu.connect("clicked", lambda *_: self._copy_url())
+            b_ct = Gtk.Button(label="Copy Title")
+            b_ct.connect("clicked", lambda *_: self._copy_title())
+            for b in (b_web, b_cu, b_ct):
+                vbx.append(b)
+            pop.set_child(vbx)
+            more.set_popover(pop)
+            btn_box.append(more)
         self.append(btn_box)
 
         # Load thumbnail
@@ -1139,7 +1213,7 @@ class ResultRow(Gtk.Box):
         # Try with proxy (if valid), then fallback without
         data: bytes | None = None
         try:
-            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies) as client:
+            with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies, headers=HEADERS) as client:
                 r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
                 r.raise_for_status()
                 data = r.content
@@ -1148,7 +1222,7 @@ class ResultRow(Gtk.Box):
             # Fallback: retry without proxy if we had one
             try:
                 if self._proxies:
-                    with httpx.Client(timeout=10.0, follow_redirects=True) as client2:
+                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client2:
                         r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
                         r2.raise_for_status()
                         data = r2.content
@@ -1166,6 +1240,10 @@ class ResultRow(Gtk.Box):
             loader.close()
             pixbuf = loader.get_pixbuf()
             if pixbuf:
+                # Check for tiny placeholder images (e.g. 1x1)
+                if pixbuf.get_width() < 10 or pixbuf.get_height() < 10:
+                    self._set_thumb_placeholder()
+                    return
                 texture = Gdk.Texture.new_for_pixbuf(pixbuf)
                 self.thumb.set_paintable(texture)
                 return
@@ -1207,7 +1285,14 @@ class ResultRow(Gtk.Box):
         try:
             disp = Gdk.Display.get_default()
             if disp and self.video and self.video.url:
-                disp.get_clipboard().set_text(self.video.url)
+                try:
+                    disp.get_clipboard().set_text(self.video.url)
+                except Exception:
+                    # Wayland fallback: primary clipboard
+                    try:
+                        disp.get_primary_clipboard().set_text(self.video.url)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1215,7 +1300,13 @@ class ResultRow(Gtk.Box):
         try:
             disp = Gdk.Display.get_default()
             if disp and self.video and self.video.title:
-                disp.get_clipboard().set_text(self.video.title)
+                try:
+                    disp.get_clipboard().set_text(self.video.title)
+                except Exception:
+                    try:
+                        disp.get_primary_clipboard().set_text(self.video.title)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
