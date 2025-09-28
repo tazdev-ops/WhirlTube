@@ -296,7 +296,8 @@ class DownloadOptionsWindow(Adw.Window):
         format_action.set_child(format_row)
         format_group.add(format_action)
         
-                # When user selects a specific format, force Quality to "Custom" for clarity        self.format_combo.connect("notify::selected", self._on_format_selected)
+        # When user selects a specific format, force Quality to "Custom" for clarity
+        self.format_combo.connect("notify::selected", self._on_format_selected)
         
         # Target directory
         dir_group = Adw.PreferencesGroup(title="Destination")
@@ -489,7 +490,10 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # Playback mode
         self.playback_mode = Adw.ComboRow(
             title="Default playback mode",
-            model=Gtk.StringList.new(["External MPV", "In-window (X11 only)"]),
+            model=Gtk.StringList.new([
+                "External MPV (separate window)",
+                "In-window (X11) / Integrated (Wayland)"
+            ]),
         )
         mode_val = settings.get("playback_mode", "external")
         self.playback_mode.set_selected(0 if mode_val == "external" else 1)

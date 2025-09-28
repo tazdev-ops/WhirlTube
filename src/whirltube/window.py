@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+import shlex
 import secrets
 import subprocess
 import threading
@@ -14,6 +16,7 @@ import re
 import httpx
 
 from . import __version__
+from .app import APP_ID
 from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
 from .history import add_search_term, add_watch, list_watch
 from .models import Video
@@ -844,6 +847,22 @@ class MainWindow(Adw.ApplicationWindow):
             if cookie_arg:
                 mpv_args = f"{mpv_args} {cookie_arg}".strip()
 
+        extra_platform_args = []
+        try:
+            # Robust backend detection
+            session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+            is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+            if is_wayland:
+                extra_platform_args.append(f"--wayland-app-id={APP_ID}")
+            else:
+                # Improve X11 mapping: set window name for grouping
+                extra_platform_args.append(f"--name={APP_ID}")
+        except Exception as e:
+            log.debug("Could not determine session type for mpv flags: %s", e)
+
+        final_mpv_args_list = shlex.split(mpv_args) + extra_platform_args
+
         if mode == "embedded":
             ok = self.mpv_widget.play(video.url)
             if ok:
@@ -856,8 +875,16 @@ class MainWindow(Adw.ApplicationWindow):
         try:
             # Unique IPC path per launch to avoid collisions
             rnd = secrets.token_hex(4)
-            ipc_path = f"/tmp/whirltube-mpv-{os.getpid()}-{rnd}.sock"
-            proc = start_mpv(video.url, extra_args=mpv_args, ipc_server_path=ipc_path)
+            ipc_dir = Path(tempfile.gettempdir())
+            ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
+
+            proc = start_mpv(
+                video.url,
+                extra_args=final_mpv_args_list,
+                ipc_server_path=ipc_path,
+            )
+
+            # Store for later cleanup and control
             self._mpv_proc = proc
             self._mpv_ipc = ipc_path
             self._mpv_current_url = video.url
@@ -878,9 +905,17 @@ class MainWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self._on_mpv_exit)
             threading.Thread(target=_watch, daemon=True).start()
         except Exception as e:
-            self._show_error(f"Failed to start MPV: {e}")
+            log.error("Failed to start mpv: %s", e)
+            self._show_error("Failed to start mpv. See logs for details.")
 
     def _on_mpv_exit(self) -> None:
+        # Clean up the IPC socket file
+        try:
+            if getattr(self, "_mpv_ipc", None) and os.path.exists(self._mpv_ipc):
+                os.remove(self._mpv_ipc)
+        except OSError as e:
+            log.warning("Failed to remove mpv IPC socket %s: %s", getattr(self, "_mpv_ipc", ""), e)
+
         self._mpv_proc = None
         self._mpv_ipc = None
         self.ctrl_bar.set_visible(False)
