@@ -15,6 +15,8 @@ _BASE_OPTS = {
     "nocheckcertificate": True,
     "retries": 3,
     "fragment_retries": 2,
+    # Use Android client to bypass some consent/regional walls
+    "extractor_args": {"youtube": {"player_client": ["android"]}},
 }
 
 
@@ -124,15 +126,31 @@ class YTDLPProvider:
 
     def trending(self) -> list[Video]:
         """List trending feed."""
-        url = "https://www.youtube.com/feed/trending"
-        log.debug("yt-dlp browse trending: %s", url)
-        try:
-            data = self._ydl_flat.extract_info(url, download=False)
-            entries = data.get("entries") or []
-            return [_entry_to_video(e) for e in entries if isinstance(e, dict)]
-        except Exception as e:
-            log.exception("trending failed: %s", e)
-            return []
+        urls = [
+            "https://www.youtube.com/feed/trending",
+            # Alternate explore page (sometimes accessible when trending redirects)
+            "https://www.youtube.com/feed/explore",
+            "https://www.youtube.com/explore",
+            # Try with explicit bp param (YouTube internal browse param occasionally helps)
+            "https://www.youtube.com/feed/trending?bp=6gQJRkVleHBsb3Jl",
+        ]
+        last_exc = None
+        for url in urls:
+            log.debug("yt-dlp browse trending: %s", url)
+            try:
+                data = self._ydl_flat.extract_info(url, download=False)
+                if not isinstance(data, dict):
+                    continue
+                entries = data.get("entries") or []
+                out = [_entry_to_video(e) for e in entries if isinstance(e, dict)]
+                if out:
+                    return out
+            except Exception as e:
+                last_exc = e
+                continue
+        if last_exc:
+            log.exception("trending failed: %s", last_exc)
+        return []
 
     def browse_url(self, url: str) -> list[Video]:
         """

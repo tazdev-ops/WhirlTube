@@ -11,6 +11,8 @@ from .models import Video
 from .provider import YTDLPProvider  # reuse helpers where helpful
 from .util import safe_httpx_proxy
 
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
 log = logging.getLogger(__name__)
 
 @dataclass(slots=True)
@@ -49,7 +51,13 @@ class InvidiousProvider:
         except Exception:
             pass
         proxy = safe_httpx_proxy(self.cfg.proxy)
-        self._client = httpx.Client(timeout=self.cfg.timeout, proxy=proxy, headers={"User-Agent": "whirltube/0.4"})
+        # http2 off avoids some flaky proxies; UA set to a browser for compatibility
+        self._client = httpx.Client(
+            timeout=self.cfg.timeout,
+            proxy=proxy,
+            headers={"User-Agent": UA},
+            http2=False,
+        )
 
     def trending(self, limit: int = 20, region: str | None = None) -> list[Video]:
         """
@@ -65,8 +73,24 @@ class InvidiousProvider:
             data = r.json()
             items: list[dict] = data if isinstance(data, list) else []
         except Exception as e:
-            log.debug("Invidious trending failed (%s); fallback to yt-dlp", e)
-            return self._fallback.trending()
+            log.debug("Invidious trending failed (%s); retrying without TLS verify", e)
+            # One retry with verify=False to survive some MITM/broken proxies
+            try:
+                proxy = safe_httpx_proxy(self.cfg.proxy)
+                with httpx.Client(
+                    timeout=self.cfg.timeout,
+                    proxy=proxy,
+                    headers={"User-Agent": UA},
+                    http2=False,
+                    verify=False,
+                ) as c:
+                    r = c.get(f"{self.cfg.base}/api/v1/trending", params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                    items = data if isinstance(data, list) else []
+            except Exception as e2:
+                log.debug("Invidious trending re-try failed (%s); fallback to yt-dlp", e2)
+                return self._fallback.trending()
 
         vids: list[Video] = []
         for it in items:
