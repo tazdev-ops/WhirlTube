@@ -747,7 +747,12 @@ class MainWindow(Adw.ApplicationWindow):
                 vids = self.provider.trending()
             except Exception:
                 vids = []
-            GLib.idle_add(self._populate_results, vids)
+            def show():
+                self._populate_results(vids)
+                if not vids:
+                    self._show_toast("Trending is unavailable on your network/region right now.")
+                return False
+            GLib.idle_add(show)
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- Browse helpers ----------

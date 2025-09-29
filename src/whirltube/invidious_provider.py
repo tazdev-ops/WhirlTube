@@ -73,24 +73,25 @@ class InvidiousProvider:
             data = r.json()
             items: list[dict] = data if isinstance(data, list) else []
         except Exception as e:
-            log.debug("Invidious trending failed (%s); retrying without TLS verify", e)
-            # One retry with verify=False to survive some MITM/broken proxies
+            log.debug("Invidious trending failed (%s); retrying verify=False", e)
             try:
                 proxy = safe_httpx_proxy(self.cfg.proxy)
-                with httpx.Client(
-                    timeout=self.cfg.timeout,
-                    proxy=proxy,
-                    headers={"User-Agent": UA},
-                    http2=False,
-                    verify=False,
-                ) as c:
+                with httpx.Client(timeout=self.cfg.timeout, proxies=proxy, headers={"User-Agent": UA}, http2=False, verify=False) as c:
                     r = c.get(f"{self.cfg.base}/api/v1/trending", params=params)
                     r.raise_for_status()
                     data = r.json()
                     items = data if isinstance(data, list) else []
             except Exception as e2:
-                log.debug("Invidious trending re-try failed (%s); fallback to yt-dlp", e2)
-                return self._fallback.trending()
+                log.debug("Invidious trending failed (verify=False) (%s); retrying without proxy", e2)
+                try:
+                    with httpx.Client(timeout=self.cfg.timeout, headers={"User-Agent": UA}, http2=False, verify=False) as c2:
+                        r = c2.get(f"{self.cfg.base}/api/v1/trending", params=params)
+                        r.raise_for_status()
+                        data = r.json()
+                        items = data if isinstance(data, list) else []
+                except Exception as e3:
+                    log.debug("Invidious trending final fallback failed (%s); using yt-dlp", e3)
+                    return self._fallback.trending()
 
         vids: list[Video] = []
         for it in items:
