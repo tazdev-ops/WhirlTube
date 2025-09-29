@@ -144,7 +144,9 @@ class YTDLPProvider:
         log.debug("browse url: %s", url)
         try:
             data = self._ydl_flat.extract_info(url, download=False)
-            entries = data.get("entries")
+            if not isinstance(data, dict):
+                raise RuntimeError("yt-dlp returned no data")
+            entries = data.get("entries") or []
             if entries:
                 return [_entry_to_video(e) for e in entries if isinstance(e, dict)]
             # Single item
@@ -282,9 +284,13 @@ def _entry_to_video(e: dict) -> Video:
     if t == "playlist" or ie in {"YoutubePlaylist", "YoutubeTab"}:
         kind = "playlist"
         webpage = e.get("webpage_url") or webpage
-    elif ie in {"YoutubeChannel"} or e.get("channel_url") or (e.get("playlist_uploader") and not e.get("duration")):
+    elif (
+        ie in {"YoutubeChannel"}
+        or (not e.get("duration") and str(e.get("id") or "").startswith("UC"))
+        or (not e.get("duration") and "youtube.com/channel/" in str(e.get("webpage_url") or e.get("url") or ""))
+    ):
         kind = "channel"
-        ch = e.get("channel_url") or e.get("uploader_url") or webpage
+        ch = e.get("channel_url") or e.get("uploader_url") or e.get("url") or webpage
         if ch:
             webpage = _ensure_channel_root(ch) + "/videos"
     elif t == "url" and "playlist" in (e.get("url") or ""):

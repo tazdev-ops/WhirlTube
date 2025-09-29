@@ -739,6 +739,9 @@ class MainWindow(Adw.ApplicationWindow):
             self.results_box.append(Gtk.Label(label="No results."))
             return
         for v in videos:
+            import logging
+            log = logging.getLogger("whirltube.window")
+            log.debug("row kind=%s title=%s", v.kind, v.title)
             row = ResultRow(
                 video=v,
                 on_play=self._play_video,
@@ -1248,9 +1251,9 @@ class ResultRow(Gtk.Box):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         if video.is_playable:
             play_btn = Gtk.Button(label="Play")
-            play_btn.connect("clicked", lambda *_: self.on_play(self.video))
+            play_btn.connect("clicked", self._on_play_clicked)
             dl_btn = Gtk.Button(label="Download…")
-            dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
+            dl_btn.connect("clicked", self._on_download_clicked)
             btn_box.append(play_btn)
             btn_box.append(dl_btn)
             # Compact "More…" menu
@@ -1328,6 +1331,25 @@ class ResultRow(Gtk.Box):
         else:
             # No URL -> placeholder
             GLib.idle_add(self._set_thumb_placeholder)
+
+    def _on_play_clicked(self, *_a):
+        import logging
+        log = logging.getLogger("whirltube.window")
+        try:
+            log.debug("ResultRow Play clicked: %s (%s)", self.video.title, self.video.url)
+            if callable(self.on_play):
+                self.on_play(self.video)
+            else:
+                log.error("on_play is not callable: %r", self.on_play)
+        except Exception as e:
+            log.exception("on_play failed: %s", e)
+
+    def _on_download_clicked(self, *_a):
+        import logging
+        log = logging.getLogger("whirltube.window")
+        log.debug("ResultRow Download clicked: %s", self.video.title)
+        if callable(self.on_download_opts):
+            self.on_download_opts(self.video)
 
     def _load_thumb(self) -> None:
         # Try with proxy (if valid), then fallback without
