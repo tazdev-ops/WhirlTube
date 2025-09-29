@@ -135,12 +135,12 @@ class DownloadRow(Gtk.Box):
 
     def attach_task(self, task: Any) -> None:
         self.task = task
+        self.label.set_text(f"Downloading: {self._base_title}")
+        self._state = "downloading"
+        # While running, ensure retry/remove disabled
         try:
-            self.label.set_text(f"Downloading: {self._base_title}")
-            self._state = "downloading"
-            # While running, ensure retry/remove disabled
-            self.btn_retry.set_sensitive(False)
-            self.btn_remove.set_sensitive(False)
+            self._btn_m_retry.set_sensitive(False)
+            self._btn_m_remove.set_sensitive(False)
         except Exception:
             pass
 

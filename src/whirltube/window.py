@@ -558,6 +558,12 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings["win_w"], self.settings["win_h"] = int(self.get_width()), int(self.get_height())
         except Exception:
             pass
+        # Shut down thumbnail loader pool
+        try:
+            self._thumb_loader_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
         # Persist queue (best effort)
         try:
             self.download_manager.persist_queue()
@@ -611,6 +617,9 @@ class MainWindow(Adw.ApplicationWindow):
                             host = urlparse((self.settings.get("invidious_instance") or "").strip()).hostname
                             if host:
                                 extra.append(host)
+                                # common subdomain case
+                                if not host.startswith("www."):
+                                    extra.append("www." + host)
                         if not is_valid_youtube_url(url, extra):
                             self._show_error("This doesn't look like a YouTube/Invidious URL.")
                         else:
@@ -755,6 +764,7 @@ class MainWindow(Adw.ApplicationWindow):
                 on_unfollow=self._unfollow_channel,
                 followed=is_followed(v.url) if v.kind == "channel" else False,
                 on_open_channel=self._open_channel_from_video,
+                on_toast=self._show_toast,
             )
             self.results_box.append(row)
 
@@ -1193,6 +1203,7 @@ class ResultRow(Gtk.Box):
         on_unfollow: Callable[[Video], None] | None = None,
         followed: bool = False,
         on_open_channel: Callable[[Video], None] | None = None,
+        on_toast: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.video = video
@@ -1207,6 +1218,7 @@ class ResultRow(Gtk.Box):
         self.on_unfollow = on_unfollow
         self._followed = followed
         self._http_proxy = http_proxy
+        self.on_toast = on_toast
         self._proxies = safe_httpx_proxy(http_proxy)
 
         self.set_margin_top(6)
@@ -1357,7 +1369,7 @@ class ResultRow(Gtk.Box):
         try:
             # For httpx 0.28.1+, use proxy parameter directly when _proxies is a string
             if self._proxies:
-                with httpx.Client(timeout=10.0, follow_redirects=True, proxy=self._proxies, headers=HEADERS) as client:
+                with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies, headers=HEADERS) as client:
                     r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
                     r.raise_for_status()
                     data = r.content
@@ -1445,33 +1457,36 @@ class ResultRow(Gtk.Box):
             pass
 
     def _copy_url(self) -> None:
-        try:
-            disp = Gdk.Display.get_default()
-            if disp and self.video and self.video.url:
-                try:
-                    disp.get_clipboard().set_text(self.video.url)
-                except Exception:
-                    # Wayland fallback: primary clipboard
-                    try:
-                        disp.get_primary_clipboard().set_text(self.video.url)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        text = self.video.url or ""
+        if not text:
+            return
+        def do_copy():
+            try:
+                disp = Gdk.Display.get_default()
+                if disp:
+                    disp.get_clipboard().set_text(text)
+                    if self.on_toast:
+                        self.on_toast("URL copied to clipboard")
+            except Exception:
+                pass
+            return False
+        GLib.idle_add(do_copy)
 
     def _copy_title(self) -> None:
-        try:
-            disp = Gdk.Display.get_default()
-            if disp and self.video and self.video.title:
-                try:
-                    disp.get_clipboard().set_text(self.video.title)
-                except Exception:
-                    try:
-                        disp.get_primary_clipboard().set_text(self.video.title)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        text = self.video.title or ""
+        if not text:
+            return
+        def do_copy():
+            try:
+                disp = Gdk.Display.get_default()
+                if disp:
+                    disp.get_clipboard().set_text(text)
+                    if self.on_toast:
+                        self.on_toast("Title copied to clipboard")
+            except Exception:
+                pass
+            return False
+        GLib.idle_add(do_copy)
 
 def _fmt_meta(v: Video) -> str:
     ch = v.channel or "Unknown channel"

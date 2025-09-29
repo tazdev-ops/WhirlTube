@@ -174,6 +174,9 @@ class YTDLPProvider:
         """Fetch related/suggested items. Falls back to title-based search if missing."""
         try:
             info = self._ydl_full.extract_info(video_url, download=False)
+            if not isinstance(info, dict):
+                log.debug("related: no data for %s", video_url)
+                return []
         except Exception as e:
             log.exception("related failed: %s", e)
             return []
@@ -192,6 +195,9 @@ class YTDLPProvider:
                 spec = f"ytsearch20:{title}"
                 try:
                     s = self._ydl_flat.extract_info(spec, download=False)
+                    if not isinstance(s, dict):
+                        log.debug("related fallback: no data for %s", spec)
+                        return out
                     entries = s.get("entries") or []
                     out = [_entry_to_video(e) for e in entries if isinstance(e, dict)]
                     # Filter out the same URL if present
@@ -207,9 +213,10 @@ class YTDLPProvider:
         """
         try:
             info = self._ydl_full.extract_info(video_url, download=False)
+            if not isinstance(info, dict):
+                log.debug("channel_url_of: no data for %s", video_url)
+                return None
         except Exception:
-            return None
-        if not isinstance(info, dict):
             return None
         ch = info.get("channel_url") or info.get("uploader_url")
         if isinstance(ch, str) and ch.strip():
@@ -221,7 +228,9 @@ class YTDLPProvider:
 
     def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
         """Fetch top-level comments when available via yt-dlp API."""
-        opts = dict(_BASE_OPTS, **{"skip_download": True, "getcomments": True})
+        opts = dict(self._opts_base, **{"skip_download": True, "getcomments": True})
+        # Optional: nudge yt-dlp comment behavior (doesn't hurt):
+        # opts.setdefault("extractor_args", {"youtube": {"comment_sort": ["top"]}})
         y = YoutubeDL(opts)
         try:
             info = y.extract_info(video_url, download=False)
