@@ -79,12 +79,14 @@ def is_valid_youtube_url(url: str, allowed_hosts: Iterable[str] | None = None) -
     if not host:
         return False
     # Core YouTube hosts
-    if host.endswith("youtube.com") or host == "youtu.be":
+    if host.endswith("youtube.com") or host == "youtu.be" or host.endswith("youtube-nocookie.com"):
         return True
     # Extra allowed hosts (e.g., Invidious)
     if allowed_hosts:
-        host_set = {h.lower().strip() for h in allowed_hosts if isinstance(h, str) and h.strip()}
-        # Exact hostname match
-        if host in host_set:
-            return True
+        suffixes = [h.lower().strip() for h in allowed_hosts if isinstance(h, str) and h.strip()]
+        for suf in suffixes:
+            # accept exact or subdomain match
+            if host == suf or host.endswith("." + suf):
+                return True
+    return False
     return False

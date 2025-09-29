@@ -37,6 +37,9 @@ def list_subscriptions() -> list[Subscription]:
         url = (it.get("url") or "").strip()
         if not url:
             continue
+        # normalize trailing /videos to channel root (keep as-is if not a channel)
+        if "/channel/" in url and url.endswith("/videos"):
+            url = url[:-7]
         title = (it.get("title") or None)
         out.append(Subscription(url=url, title=title))
     return out

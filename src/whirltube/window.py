@@ -166,6 +166,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.btn_feed.connect("clicked", self._on_feed)
         header.pack_start(self.btn_feed)
 
+        self.btn_trending = Gtk.Button(label="Trending")
+        self.btn_trending.set_tooltip_text("YouTube trending now")
+        self.btn_trending.connect("clicked", self._on_trending)
+        header.pack_start(self.btn_trending)
+
         self.btn_qdl = Gtk.Button(label="Quick Download")
         self.btn_qdl.set_tooltip_text("Batch download multiple URLs")
         self.btn_qdl.connect("clicked", self._on_quick_download)
@@ -176,6 +181,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.search.set_placeholder_text("Search YouTube…")
         header.set_title_widget(self.search)
         self.search.connect("activate", self._on_search_activate)
+        # Clear text when the user presses Escape or the clear icon
+        def _stop_search(_entry, *_a):
+            try:
+                self.search.set_text("")
+                self._set_welcome()
+            except Exception:
+                pass
+        self.search.connect("stop-search", _stop_search)
         
         # Filters popover
         self.btn_filters = Gtk.MenuButton(icon_name="view-list-symbolic")
@@ -285,6 +298,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         # MPV actions (menu + hotkeys)
         self._install_mpv_actions()
+        self._install_key_controller()
 
         # Track current URL for timestamp copying
         self._mpv_current_url: str | None = None
@@ -364,6 +378,33 @@ class MainWindow(Adw.ApplicationWindow):
         app.set_accels_for_action("win.mpv_speed_up", ["equal", "KP_Add"])
         app.set_accels_for_action("win.mpv_copy_ts", ["T", "t"])
         app.set_accels_for_action("win.stop_mpv", ["X", "x"])
+
+    def _install_key_controller(self) -> None:
+        ctrl = Gtk.EventControllerKey()
+        def on_key(_c, keyval, keycode, state):
+            # Only handle when MPV is running
+            if self._mpv_proc is None:
+                return False
+            k = Gdk.keyval_name(keyval) or ""
+            k = k.lower()
+            handled = False
+            if k == "j":
+                self._mpv_seek(-10); handled = True
+            elif k == "k":
+                self._mpv_cycle_pause(); handled = True
+            elif k == "l":
+                self._mpv_seek(10); handled = True
+            elif k in ("minus", "kp_subtract"):
+                self._mpv_speed_delta(-0.1); handled = True
+            elif k in ("equal", "kp_add", "plus"):
+                self._mpv_speed_delta(0.1); handled = True
+            elif k == "x":
+                self._mpv_stop(); handled = True
+            elif k == "t":
+                self._mpv_copy_ts(); handled = True
+            return handled
+        ctrl.connect("key-pressed", on_key)
+        self.add_controller(ctrl)
 
     def _create_actions(self) -> None:
         about = Gio.SimpleAction.new("about", None)
@@ -558,6 +599,11 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings["win_w"], self.settings["win_h"] = int(self.get_width()), int(self.get_height())
         except Exception:
             pass
+        # Stop MPV if running
+        try:
+            self._mpv_stop()
+        except Exception:
+            pass
         # Shut down thumbnail loader pool
         try:
             self._thumb_loader_pool.shutdown(wait=False, cancel_futures=True)
@@ -692,6 +738,16 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:
                 vids_all = []
             GLib.idle_add(self._populate_results, vids_all)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_trending(self, *_a) -> None:
+        self._show_loading("Loading trending…")
+        def worker():
+            try:
+                vids = self.provider.trending()
+            except Exception:
+                vids = []
+            GLib.idle_add(self._populate_results, vids)
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- Browse helpers ----------
@@ -897,7 +953,12 @@ class MainWindow(Adw.ApplicationWindow):
             # Sets WM_CLASS (X11); harmless on Wayland builds that accept it
             extra_platform_args.append(f"--class={APP_ID}")
 
-        final_mpv_args_list = shlex.split(mpv_args) + extra_platform_args
+        try:
+            base_args = shlex.split(mpv_args)
+        except Exception:
+            log.warning("Failed to parse MPV args; launching without user args")
+            base_args = []
+        final_mpv_args_list = base_args + extra_platform_args
 
         # Try embedded first only when actually allowed
         if mode == "embedded":
@@ -979,7 +1040,10 @@ class MainWindow(Adw.ApplicationWindow):
             threading.Thread(target=_watch, daemon=True).start()
         except Exception as e:
             log.error("Failed to start mpv: %s", e)
-            self._show_error("Failed to start mpv. See logs for details.")
+            if os.environ.get("WHIRLTUBE_DEBUG") and 'log_file' in locals() and log_file:
+                self._show_error(f"Failed to start mpv. See log: {log_file}")
+            else:
+                self._show_error("Failed to start mpv. See logs for details.")
 
     def _on_mpv_exit(self) -> None:
         # Clean up the IPC socket file
@@ -1291,17 +1355,21 @@ class ResultRow(Gtk.Box):
             more.set_popover(pop)
             btn_box.append(more)
         else:
-            # Non-playable: show Open; if channel, also Follow/Unfollow
-            open_btn = Gtk.Button(label="Open")
-            open_btn.set_tooltip_text("Open this playlist/channel")
-            open_btn.connect("clicked", lambda *_: self.on_open(self.video))
-            btn_box.append(open_btn)
-
-            dl_btn = Gtk.Button(label="Download…")
-            dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
-            btn_box.append(dl_btn)
-
-            if self.video.kind == "channel":
+            # Non-playable kinds
+            if self.video.kind == "playlist":
+                open_btn = Gtk.Button(label="Open")
+                open_btn.set_tooltip_text("Open this playlist")
+                open_btn.connect("clicked", lambda *_: self.on_open(self.video))
+                btn_box.append(open_btn)
+                # Playlist may be downloaded (folder structure)
+                dl_btn = Gtk.Button(label="Download…")
+                dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
+                btn_box.append(dl_btn)
+            elif self.video.kind == "channel":
+                open_btn = Gtk.Button(label="Open")
+                open_btn.set_tooltip_text("Open this channel")
+                open_btn.connect("clicked", lambda *_: self.on_open(self.video))
+                btn_box.append(open_btn)
                 label = "Unfollow" if self._followed else "Follow"
                 follow_btn = Gtk.Button(label=label)
                 def _toggle_follow(_btn):
@@ -1311,15 +1379,22 @@ class ResultRow(Gtk.Box):
                                 self.on_unfollow(self.video)
                             self._followed = False
                             _btn.set_label("Follow")
+                            if self.on_toast:
+                                self.on_toast("Unfollowed channel")
                         else:
                             if self.on_follow:
                                 self.on_follow(self.video)
                             self._followed = True
                             _btn.set_label("Unfollow")
+                            if self.on_toast:
+                                self.on_toast("Followed channel")
                     except Exception:
                         pass
                 follow_btn.connect("clicked", _toggle_follow)
                 btn_box.append(follow_btn)
+            else:
+                # comment or other: no "Open" or "Download…" actions
+                pass
             # Compact "More…" for common actions
             more = Gtk.MenuButton(label="More…")
             pop = Gtk.Popover()
@@ -1369,7 +1444,7 @@ class ResultRow(Gtk.Box):
         try:
             # For httpx 0.28.1+, use proxy parameter directly when _proxies is a string
             if self._proxies:
-                with httpx.Client(timeout=10.0, follow_redirects=True, proxies=self._proxies, headers=HEADERS) as client:
+                with httpx.Client(timeout=10.0, follow_redirects=True, proxy=self._proxies, headers=HEADERS) as client:
                     r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
                     r.raise_for_status()
                     data = r.content
@@ -1464,7 +1539,11 @@ class ResultRow(Gtk.Box):
             try:
                 disp = Gdk.Display.get_default()
                 if disp:
-                    disp.get_clipboard().set_text(text)
+                    try:
+                        disp.get_clipboard().set_text(text)
+                    except Exception:
+                        # best-effort fallback
+                        disp.get_primary_clipboard().set_text(text)
                     if self.on_toast:
                         self.on_toast("URL copied to clipboard")
             except Exception:
@@ -1480,7 +1559,11 @@ class ResultRow(Gtk.Box):
             try:
                 disp = Gdk.Display.get_default()
                 if disp:
-                    disp.get_clipboard().set_text(text)
+                    try:
+                        disp.get_clipboard().set_text(text)
+                    except Exception:
+                        # best-effort fallback
+                        disp.get_primary_clipboard().set_text(text)
                     if self.on_toast:
                         self.on_toast("Title copied to clipboard")
             except Exception:

@@ -70,7 +70,7 @@ class QuickDownloadWindow(Gtk.Window):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         vgrid = Gtk.Grid(column_spacing=8, row_spacing=8)
         vgrid.attach(Gtk.Label(label="Resolution (-S res)", xalign=0), 0, 0, 1, 1)
-        self.dd_res = Gtk.DropDown.new_from_strings(["2160 (4K)", "1440 (2K)", "1080", "720", "480"])
+        self.dd_res = Gtk.DropDown.new_from_strings(["2160 (4K)", "1440 (2K)", "1080", "720", "480", "360", "240", "144"])
         self.dd_res.set_selected(2)
         vgrid.attach(self.dd_res, 1, 0, 1, 1)
         vgrid.attach(Gtk.Label(label="Remux to", xalign=0), 0, 1, 1, 1)
@@ -242,7 +242,8 @@ class QuickDownloadWindow(Gtk.Window):
 
         if title == "Video":
             sel = self.dd_res.get_selected()
-            res = ["res:2160", "res:1440", "res:1080", "res:720", "res:480"][sel if sel >= 0 else 2]
+            reslist = ["res:2160","res:1440","res:1080","res:720","res:480","res:360","res:240","res:144"]
+            res = reslist[sel if sel >= 0 else 2]
             args += ["-S", res]
             fmt = ["mp4", "mkv", "webm"][self.dd_vidfmt.get_selected() or 0]
             args += ["--remux-video", fmt]
@@ -283,6 +284,14 @@ class QuickDownloadWindow(Gtk.Window):
         self._set_msg("Initializing…")
         path = self.settings.get("ytdlp_path", "") or None
         self.runner.start(args, bin_path=path)
+        # Watch for process exit, then mark end if not already stopped
+        import threading
+        def _watch():
+            import time
+            while self.runner.is_running():
+                time.sleep(0.2)
+            GLib.idle_add(self._end, ok="Done")
+        threading.Thread(target=_watch, daemon=True).start()
 
     def _on_stop(self, *_):
         self.runner.stop()
@@ -315,7 +324,8 @@ class QuickDownloadWindow(Gtk.Window):
                     msg += f" {pi}/{pc}"
                 self._set_msg(msg)
             elif ev.kind == "end_of_playlist":
-                self._end(ok="Playlist finished")
+                # Do not end early; wait for process exit
+                pass
             elif ev.kind == "end_of_video":
                 pass
         return False

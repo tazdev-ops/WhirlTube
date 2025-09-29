@@ -160,8 +160,15 @@ class DownloadOptionsWindow(Adw.Window):
         header = Adw.HeaderBar()
         root.add_top_bar(header)
 
-        # Main box
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        # Main box (scrollable content)
+        main_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
         
         # Quality tab
         quality_group = Adw.PreferencesGroup(title="Quality")
@@ -310,17 +317,33 @@ class DownloadOptionsWindow(Adw.Window):
         # Connect quality mode change to show/hide custom format
         self.quality_mode.connect("notify::selected", self._on_quality_mode_changed)
         
-        # Buttons
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # Scrollable content
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        scroller.set_child(main_box)
+        root.set_content(scroller)
+
+        # Bottom bar with actions (always visible)
         btn_cancel = Gtk.Button(label="Cancel")
         btn_cancel.connect("clicked", lambda *_: self.destroy())
         btn_download = Gtk.Button(label="Download", css_classes=["suggested-action"])
         btn_download.connect("clicked", self._on_download)
-        btns.append(btn_cancel)
-        btns.append(btn_download)
-        main_box.append(btns)
-        
-        root.set_content(main_box)
+        # Make Download the default action (Enter)
+        try:
+            btn_download.set_can_default(True)
+            # GTK4: set default widget on the window
+            self.set_default_widget(btn_download)  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                btn_download.grab_default()
+            except Exception:
+                pass
+
+        footer = Adw.HeaderBar()
+        footer.pack_start(btn_cancel)
+        footer.pack_end(btn_download)
+        root.add_bottom_bar(footer)
         
         # Internal state
         self._accepted = False
@@ -502,10 +525,10 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # Playback quality
         self.playback_quality = Adw.ComboRow(
             title="Preferred playback quality",
-            model=Gtk.StringList.new(["Auto (best)", "2160p", "1440p", "1080p", "720p", "480p"]),
+            model=Gtk.StringList.new(["Auto (best)", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"]),
         )
         quality_val = settings.get("mpv_quality", "auto")
-        quality_idx = {"auto": 0, "2160": 1, "1440": 2, "1080": 3, "720": 4, "480": 5}.get(
+        quality_idx = {"auto": 0, "2160": 1, "1440": 2, "1080": 3, "720": 4, "480": 5, "360": 6, "240": 7, "144": 8}.get(
             quality_val, 0
         )
         self.playback_quality.set_selected(quality_idx)

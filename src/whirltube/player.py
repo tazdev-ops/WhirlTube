@@ -21,8 +21,13 @@ def mpv_supports_option(opt: str) -> bool:
             capture_output=True, text=True, timeout=2,
         )
         if res.returncode == 0:
-            # Each line starts with the option name
-            opts = {line.split()[0] for line in res.stdout.splitlines() if line}
+            names = set()
+            for line in res.stdout.splitlines():
+                if not line:
+                    continue
+                head = line.split()[0]
+                names.add(head.split("=")[0])
+            opts = names
             ok = opt in opts
         else:
             ok = False

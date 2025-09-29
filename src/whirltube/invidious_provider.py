@@ -29,6 +29,14 @@ class InvidiousProvider:
         self._fallback = fallback or YTDLPProvider()
         self._client: httpx.Client | None = None
         self._init_client()
+        self._prefer_invidious_links = True  # return base/watch?v=ID
+
+    def _watch_url(self, vid: str) -> str:
+        if not vid:
+            return ""
+        if self._prefer_invidious_links:
+            return f"{self.cfg.base}/watch?v={vid}"
+        return f"https://www.youtube.com/watch?v={vid}"
 
     def set_proxy(self, proxy: str | None) -> None:
         self.cfg.proxy = proxy or None
@@ -41,7 +49,56 @@ class InvidiousProvider:
         except Exception:
             pass
         proxy = safe_httpx_proxy(self.cfg.proxy)
-        self._client = httpx.Client(timeout=self.cfg.timeout, proxies=proxy, headers={"User-Agent": "whirltube/0.4"})
+        self._client = httpx.Client(timeout=self.cfg.timeout, proxy=proxy, headers={"User-Agent": "whirltube/0.4"})
+
+    def trending(self, limit: int = 20, region: str | None = None) -> list[Video]:
+        """
+        Return trending videos. Tries Invidious API; falls back to yt-dlp.
+        """
+        params: dict[str, Any] = {"type": "video"}
+        if region:
+            params["region"] = region
+        try:
+            assert self._client is not None
+            r = self._client.get(f"{self.cfg.base}/api/v1/trending", params=params)
+            r.raise_for_status()
+            data = r.json()
+            items: list[dict] = data if isinstance(data, list) else []
+        except Exception as e:
+            log.debug("Invidious trending failed (%s); fallback to yt-dlp", e)
+            return self._fallback.trending()
+
+        vids: list[Video] = []
+        for it in items:
+            try:
+                if it.get("type") and it.get("type") != "video":
+                    continue
+                vid = str(it.get("videoId") or "")
+                if not vid:
+                    continue
+                dur = int(it.get("lengthSeconds") or 0) or None
+                thumbs = it.get("videoThumbnails") or []
+                thumb = None
+                if isinstance(thumbs, list):
+                    best = max((t for t in thumbs if isinstance(t, dict)), key=lambda x: int(x.get("width") or 0), default=None)
+                    if best:
+                        thumb = best.get("url")
+                vids.append(
+                    Video(
+                        id=vid,
+                        title=it.get("title") or "(untitled)",
+                        url=self._watch_url(vid),
+                        channel=it.get("author") or None,
+                        duration=dur,
+                        thumb_url=thumb,
+                        kind="video",
+                    )
+                )
+                if len(vids) >= limit:
+                    break
+            except Exception:
+                continue
+        return vids
 
     # ---------- Search ----------
 
@@ -120,7 +177,7 @@ class InvidiousProvider:
                 if not _dur_ok(dur) or not _time_ok(pub):
                     continue
                 vid = str(it.get("videoId") or "")
-                url = f"https://www.youtube.com/watch?v={vid}" if vid else (it.get("videoThumbnails") or [{}])[0].get("url", "")
+                url = self._watch_url(vid) if vid else (it.get("videoThumbnails") or [{}])[0].get("url", "")
                 thumb = None
                 thumbs = it.get("videoThumbnails") or []
                 if thumbs and isinstance(thumbs, list):
@@ -175,7 +232,7 @@ class InvidiousProvider:
         for it in items or []:
             try:
                 vid = str(it.get("videoId") or "")
-                url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
+                url = self._watch_url(vid) if vid else ""
                 dur = int(it.get("lengthSeconds") or 0) or None
                 thumb = None
                 thumbs = it.get("videoThumbnails") or []
