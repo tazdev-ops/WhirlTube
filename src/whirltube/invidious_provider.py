@@ -90,8 +90,25 @@ class InvidiousProvider:
                         data = r.json()
                         items = data if isinstance(data, list) else []
                 except Exception as e3:
-                    log.debug("Invidious trending final fallback failed (%s); using yt-dlp", e3)
-                    return self._fallback.trending()
+                    log.debug("Invidious trending verify/proxy fallbacks failed (%s); trying /popular and region=US", e3)
+                    # Try regioned trending
+                    try:
+                        with httpx.Client(timeout=self.cfg.timeout, headers={"User-Agent": UA}, http2=False, verify=False) as c3:
+                            r = c3.get(f"{self.cfg.base}/api/v1/trending", params={"type": "video", "region": region or "US"})
+                            r.raise_for_status()
+                            data = r.json()
+                            items = data if isinstance(data, list) else []
+                    except Exception:
+                        # Try /popular
+                        try:
+                            with httpx.Client(timeout=self.cfg.timeout, headers={"User-Agent": UA}, http2=False, verify=False) as c4:
+                                r = c4.get(f"{self.cfg.base}/api/v1/popular")
+                                r.raise_for_status()
+                                data = r.json()
+                                items = data if isinstance(data, list) else []
+                        except Exception as e4:
+                            log.debug("Invidious /popular also failed (%s); using yt-dlp", e4)
+                            return self._fallback.trending()
 
         vids: list[Video] = []
         for it in items:

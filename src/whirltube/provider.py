@@ -15,8 +15,13 @@ _BASE_OPTS = {
     "nocheckcertificate": True,
     "retries": 3,
     "fragment_retries": 2,
-    # Use Android client to bypass some consent/regional walls
+    # Use Android client to bypass consent/region walls
     "extractor_args": {"youtube": {"player_client": ["android"]}},
+    # Hint language/region + UA to reduce redirects
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept-Language": "en-US,en;q=0.9",
+    },
 }
 
 
@@ -34,6 +39,15 @@ class YTDLPProvider:
         self._opts_base = dict(_BASE_OPTS)
         if proxy:
             self._opts_base["proxy"] = proxy
+        self._reinit()
+
+    def set_cookies_from_browser(self, spec: str | None) -> None:
+        """spec example: 'firefox+gnomekeyring:default::Work'"""
+        self._opts_base = dict(_BASE_OPTS)
+        if "proxy" in self._opts_base:
+            pass  # will be re-added by caller via set_proxy if needed
+        if spec and spec.strip():
+            self._opts_base["cookiesfrombrowser"] = spec.strip()
         self._reinit()
 
     def _reinit(self) -> None:
@@ -125,13 +139,18 @@ class YTDLPProvider:
     # ---------- Browse helpers ----------
 
     def trending(self) -> list[Video]:
-        """List trending feed."""
+        """List trending feed with multiple fallbacks."""
         urls = [
+            # Mobile + region/language hints first
+            "https://m.youtube.com/feed/trending?gl=US&hl=en",
+            "https://m.youtube.com/explore?gl=US&hl=en",
+            # Desktop with hints
+            "https://www.youtube.com/feed/trending?gl=US&hl=en",
+            "https://www.youtube.com/explore?gl=US&hl=en",
+            # Legacy/alt
             "https://www.youtube.com/feed/trending",
-            # Alternate explore page (sometimes accessible when trending redirects)
             "https://www.youtube.com/feed/explore",
             "https://www.youtube.com/explore",
-            # Try with explicit bp param (YouTube internal browse param occasionally helps)
             "https://www.youtube.com/feed/trending?bp=6gQJRkVleHBsb3Jl",
         ]
         last_exc = None

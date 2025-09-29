@@ -84,6 +84,14 @@ class MainWindow(Adw.ApplicationWindow):
             self.provider: YTDLPProvider | InvidiousProvider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
         else:
             self.provider: YTDLPProvider | InvidiousProvider = YTDLPProvider(proxy or None)
+        # Pass cookies to provider as well (helps trending/region walls)
+        try:
+            if isinstance(self.provider, YTDLPProvider):
+                spec = self._cookies_spec_for_ytdlp()
+                if spec:
+                    self.provider.set_cookies_from_browser(spec)
+        except Exception:
+            pass
         self._search_generation = 0
         self._thumb_loader_pool = ThreadPoolExecutor(max_workers=4)
         
@@ -583,6 +591,11 @@ class MainWindow(Adw.ApplicationWindow):
                     self.provider = InvidiousProvider(invid_base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
                 else:
                     self.provider = YTDLPProvider(proxy or None)
+                # Reapply cookies to provider on reconfigure
+                if isinstance(self.provider, YTDLPProvider):
+                    spec = self._cookies_spec_for_ytdlp()
+                    if spec:
+                        self.provider.set_cookies_from_browser(spec)
             except Exception:
                 # fallback to yt-dlp
                 self.provider = YTDLPProvider(proxy or None)
@@ -1575,6 +1588,22 @@ class ResultRow(Gtk.Box):
                 pass
             return False
         GLib.idle_add(do_copy)
+
+    def _cookies_spec_for_ytdlp(self) -> str | None:
+        if not self.settings.get("mpv_cookies_enable"):
+            return None
+        browser = (self.settings.get("mpv_cookies_browser") or "").strip()
+        if not browser:
+            return None
+        keyring = (self.settings.get("mpv_cookies_keyring") or "").strip()
+        profile = (self.settings.get("mpv_cookies_profile") or "").strip()
+        container = (self.settings.get("mpv_cookies_container") or "").strip()
+        val = browser + (f"+{keyring}" if keyring else "")
+        if profile or container:
+            val += f":{profile}"
+        if container:
+            val += f"::{container}"
+        return val
 
 def _fmt_meta(v: Video) -> str:
     ch = v.channel or "Unknown channel"
