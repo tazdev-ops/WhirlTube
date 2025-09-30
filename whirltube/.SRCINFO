@@ -1,0 +1,26 @@
+pkgbase = whirltube
+	pkgdesc = Lightweight GTK4 frontend for YouTube using mpv and yt-dlp
+	pkgver = 0.4.5
+	pkgrel = 1
+	url = https://github.com/tazdev-ops/WhirlTube
+	arch = any
+	license = GPL3
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-hatchling
+	depends = python
+	depends = gtk4
+	depends = libadwaita
+	depends = python-gobject
+	depends = yt-dlp
+	depends = python-httpx
+	depends = mpv
+	optdepends = python-mpv: in-window (embedded) playback on X11
+	optdepends = libnotify: desktop notifications
+	optdepends = python-pillow: thumbnail WebP fallback decoding
+	provides = whirltube
+	conflicts = whirltube-git
+	source = https://github.com/tazdev-ops/WhirlTube/archive/refs/tags/v0.4.5.tar.gz
+	sha256sums = b68b2a015f050b64f7179859b74a8f0d1661f7a078661f96bcd5e873a87a0b5f
+
+pkgname = whirltube

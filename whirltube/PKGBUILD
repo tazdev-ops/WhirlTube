@@ -1,0 +1,60 @@
+pkgname=whirltube
+pkgver=0.4.5
+pkgrel=1
+pkgdesc="Lightweight GTK4 frontend for YouTube using mpv and yt-dlp"
+arch=('any')
+url="https://github.com/tazdev-ops/WhirlTube"
+license=('GPL3')
+depends=('python' 'gtk4' 'libadwaita' 'python-gobject' 'yt-dlp' 'python-httpx' 'mpv')
+optdepends=(
+  'python-mpv: in-window (embedded) playback on X11'
+  'libnotify: desktop notifications'
+  'python-pillow: thumbnail WebP fallback decoding'
+)
+makedepends=('python-build' 'python-installer' 'python-hatchling')
+provides=('whirltube')
+conflicts=('whirltube-git')
+source=("https://github.com/tazdev-ops/WhirlTube/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('b68b2a015f050b64f7179859b74a8f0d1661f7a078661f96bcd5e873a87a0b5f')
+
+build() {
+  cd "WhirlTube-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "WhirlTube-${pkgver}"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  # Desktop entry (use upstream if present; otherwise create one)
+  if [[ -f data/org.whirltube.WhirlTube.desktop ]]; then
+    install -Dm644 data/org.whirltube.WhirlTube.desktop \
+      "$pkgdir/usr/share/applications/org.whirltube.WhirlTube.desktop"
+  else
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/org.whirltube.WhirlTube.desktop" <<'EOF'
+[Desktop Entry]
+Name=WhirlTube
+Comment=Lightweight GTK4 frontend for YouTube using mpv and yt-dlp
+Exec=whirltube
+Icon=whirltube
+Terminal=false
+Type=Application
+Categories=AudioVideo;Network;GTK;
+StartupWMClass=org.whirltube.WhirlTube
+EOF
+  fi
+
+  # Icons (install to system icon theme if available in source)
+  for sz in 16 24 32 48 64 128 256 512; do
+    for f in "src/whirltube/assets/icons/hicolor/${sz}x${sz}/apps/whirltube.png" \
+             "src/whirltube/assets/icons/hicolor/${sz}x${sz}/apps/whirltube.svg"; do
+      if [[ -f "$f" ]]; then
+        install -Dm644 "$f" "$pkgdir/usr/share/icons/hicolor/${sz}x${sz}/apps/whirltube.${f##*.}"
+      fi
+    done
+  done
+  if [[ -f src/whirltube/assets/icons/hicolor/scalable/apps/whirltube.svg ]]; then
+    install -Dm644 src/whirltube/assets/icons/hicolor/scalable/apps/whirltube.svg \
+      "$pkgdir/usr/share/icons/hicolor/scalable/apps/whirltube.svg"
+  fi
+}

@@ -42,6 +42,41 @@ class YTDLPProvider(Provider):
             self._opts_base["proxy"] = proxy
         self._reinit()
 
+    def _parse_cookie_spec(self, spec: str) -> tuple[str | None, str | None, str | None, str | None]:
+        """Parse yt-dlp cookie spec string into (browser, profile, keyring, container) tuple."""
+        if not spec:
+            return None, None, None, None
+
+        # Split into browser_part and profile_part at first ':'
+        if ':' not in spec:
+            browser_part = spec
+            profile_part = None
+        else:
+            browser_part, profile_part = spec.split(':', 1)
+
+        # Parse browser_part: browser[+keyring]
+        if '+' in browser_part:
+            browser, keyring = browser_part.split('+', 1)
+        else:
+            browser = browser_part
+            keyring = None
+
+        # Parse profile_part: profile[::container]
+        if profile_part is None:
+            profile = None
+            container = None
+        else:
+            if '::' in profile_part:
+                p, c = profile_part.split('::', 1)
+                profile = p if p else None
+                container = c if c else None
+            else:
+                profile = profile_part if profile_part else None
+                container = None
+
+        return browser, profile, keyring, container
+
+
     def set_cookies_from_browser(self, spec: str | None) -> None:
         """spec example: 'firefox+gnomekeyring:default::Work'"""
         self._opts_base = dict(_BASE_OPTS)
@@ -71,8 +106,13 @@ class YTDLPProvider(Provider):
                     log.warning(f"Cookie spec has too many colons: {clean_spec}, skipping")
                     self._reinit()
                     return
-                
-                self._opts_base["cookiesfrombrowser"] = clean_spec
+
+                # Parse the spec into tuple for yt-dlp API
+                browser, profile, keyring, container = self._parse_cookie_spec(clean_spec)
+                if browser:  # Only set if valid browser
+                    self._opts_base["cookiesfrombrowser"] = (browser, profile, keyring, container)
+                else:
+                    log.warning(f"Invalid browser in cookie spec: {clean_spec}, skipping")
             except Exception as e:
                 log.warning(f"Error validating cookie spec {spec}: {e}, skipping")
                 # Continue with reinit without cookies to avoid crash
@@ -83,12 +123,12 @@ class YTDLPProvider(Provider):
         opts_base = dict(self._opts_base)
         if "cookiesfrombrowser" in opts_base:
             cookie_spec = opts_base["cookiesfrombrowser"]
-            if cookie_spec and isinstance(cookie_spec, str):
+            valid = True
+            if isinstance(cookie_spec, str):
                 # Basic validation to prevent too many colons that can cause _parse_browser_specification to fail
                 # Format should be: browser+keyring:profile::container (max ~4 conceptual parts)
                 # Split by ':' and make sure no part has excessive '::' combinations
                 parts = cookie_spec.split(':')
-                valid = True
                 if len(parts) > 4:  # Likely malformed
                     log.warning(f"Invalid cookie spec format (too many parts): {cookie_spec}")
                     valid = False
@@ -100,10 +140,17 @@ class YTDLPProvider(Provider):
                         if len(sub_parts) > 2:  # More than one '::' separator in a part
                             valid = False
                             break
-                
-                if not valid:
-                    # Remove the invalid cookiesfrombrowser setting to prevent yt-dlp crash
-                    opts_base = {k: v for k, v in opts_base.items() if k != "cookiesfrombrowser"}
+            elif isinstance(cookie_spec, (list, tuple)):
+                if not (1 <= len(cookie_spec) <= 4):
+                    log.warning(f"Invalid cookie spec tuple length: {len(cookie_spec)}")
+                    valid = False
+            else:
+                log.warning(f"Invalid type for cookiesfrombrowser: {type(cookie_spec)}")
+                valid = False
+
+            if not valid:
+                # Remove the invalid cookiesfrombrowser setting to prevent yt-dlp crash
+                opts_base = {k: v for k, v in opts_base.items() if k != "cookiesfrombrowser"}
         
         # Flat for listings
         self._ydl_flat = YoutubeDL(dict(opts_base, **{"skip_download": True, "extract_flat": "in_playlist"}))
