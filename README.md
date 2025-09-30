@@ -5,7 +5,7 @@ Wayland-first, GTK 4 + Libadwaita frontend for YouTube that:
 - Searches and downloads with yt-dlp (no API keys).
 - Minimal dependencies; robust, async UI.
 
-Status: v0.4.2
+Status: v0.4.5
 
 ## Highlights
 - Search YouTube via yt-dlp (no API), browse Open URL (video/playlist/channel), view Related and Comments.

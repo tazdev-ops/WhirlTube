@@ -31,8 +31,6 @@ modules = [
   "whirltube.app",
   "whirltube.window",
   "whirltube.dialogs",
-  "whirltube.provider",
-  "whirltube.invidious_provider",
   "whirltube.downloader",
   "whirltube.download_manager",
   "whirltube.navigation_controller",
@@ -45,6 +43,14 @@ modules = [
   "whirltube.history",
   "whirltube.download_history",
   "whirltube.subscriptions",
+  "whirltube.ui.controllers.browse",
+  "whirltube.ui.widgets.result_row",
+  "whirltube.ui.widgets.mpv_controls",
+  "whirltube.services.playback",
+  "whirltube.providers.base",
+  "whirltube.providers.ytdlp",
+  "whirltube.providers.invidious",
+  "whirltube.search_filters",
 ]
 out = {}
 errs = 0

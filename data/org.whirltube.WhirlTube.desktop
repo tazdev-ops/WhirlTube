@@ -1,1 +1,13 @@
-[Desktop Entry]\nType=Application\nName=WhirlTube\nGenericName=YouTube client\nComment=Lightweight GTK4 frontend for YouTube using mpv and yt-dlp\nExec=whirltube\nIcon=whirltube\nTerminal=false\nCategories=AudioVideo;Video;GTK;\nStartupNotify=true\nStartupWMClass=org.whirltube.WhirlTube\nKeywords=YouTube;Video;MPV;yt-dlp;\nDBusActivatable=false
+[Desktop Entry]
+Type=Application
+Name=WhirlTube
+GenericName=YouTube client
+Comment=Lightweight GTK4 frontend for YouTube using mpv and yt-dlp
+Exec=whirltube
+Icon=whirltube
+Terminal=false
+Categories=AudioVideo;Video;GTK;
+StartupNotify=true
+StartupWMClass=org.whirltube.WhirlTube
+Keywords=YouTube;Video;MPV;yt-dlp;
+DBusActivatable=false

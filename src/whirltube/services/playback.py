@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+import shlex
+import secrets
+import subprocess
+import threading
+from pathlib import Path
+
+from ..models import Video
+from ..mpv_embed import MpvWidget
+from ..player import has_mpv, start_mpv, mpv_send_cmd
+from ..app import APP_ID
+from ..util import safe_httpx_proxy
+
+import gi
+from gi.repository import Gio, GLib, Gdk
+
+log = logging.getLogger(__name__)
+
+
+class PlaybackService:
+    def __init__(self, mpv_widget: MpvWidget):
+        self.mpv_widget = mpv_widget
+        # External MPV state
+        self._proc: subprocess.Popen | None = None
+        self._ipc: str | None = None
+        self._current_url: str | None = None
+        self._speed = 1.0
+        # Callbacks for UI updates
+        self._on_started_callback = None
+        self._on_stopped_callback = None
+
+    def set_callbacks(self, on_started=None, on_stopped=None):
+        """Set callbacks for playback events"""
+        self._on_started_callback = on_started
+        self._on_stopped_callback = on_stopped
+
+    def play(
+        self, 
+        video: Video, 
+        playback_mode: str, 
+        mpv_args: str,
+        quality: str | None,
+        cookies_enabled: bool,
+        cookies_browser: str,
+        cookies_keyring: str,
+        cookies_profile: str,
+        cookies_container: str,
+        http_proxy: str | None,
+        fullscreen: bool = False
+    ) -> bool:
+        """Play a video using either embedded or external MPV"""
+        # Detect Wayland/X11
+        session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+        is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+        # Quality preset
+        ytdl_fmt_val = None
+        if quality and quality != "auto":
+            try:
+                h = int(quality)
+                ytdl_fmt = f'bv*[height<={h}]+ba/b[height<={h}]'
+                ytdl_fmt_val = ytdl_fmt
+            except Exception:
+                pass
+
+        # Build MPV args for external player
+        mpv_args_list = []
+        if mpv_args:
+            try:
+                mpv_args_list = shlex.split(mpv_args)
+            except Exception:
+                log.warning("Failed to parse MPV args; launching without user args")
+        
+        if ytdl_fmt_val:
+            mpv_args_list.append(f'--ytdl-format={ytdl_fmt_val}')
+        
+        if cookies_enabled:
+            cookie_arg = self._build_cookie_arg(cookies_browser, cookies_keyring, cookies_profile, cookies_container)
+            if cookie_arg:
+                mpv_args_list.append(cookie_arg)
+        
+        if fullscreen:
+            mpv_args_list.append("--fs")
+
+        # Add platform-specific args
+        extra_platform_args = []
+        # Wayland grouping (if mpv supports it)
+        from ..player import mpv_supports_option  # Import here to avoid circular reference initially
+        if is_wayland and mpv_supports_option("wayland-app-id"):
+            extra_platform_args.append(f"--wayland-app-id={APP_ID}")
+
+        # X11 grouping via WM_CLASS (if supported)
+        if not is_wayland and mpv_supports_option("class"):
+            # Sets WM_CLASS (X11); harmless on Wayland builds that accept it
+            extra_platform_args.append(f"--class={APP_ID}")
+
+        final_mpv_args_list = mpv_args_list + extra_platform_args
+
+        # Try embedded first only when actually allowed
+        if playback_mode == "embedded":
+            log.debug("Attempting embedded playback")
+            # Configure embedded mpv with format/cookies/proxy (mirrors external path)
+            # Build ytdl-format if needed
+            try:
+                self.mpv_widget.set_ytdl_format(ytdl_fmt_val)
+            except Exception:
+                pass
+            # ytdl-raw-options: cookies + proxy
+            raw_opts = {}
+            if cookies_enabled:
+                # Translate cookie arg string '--ytdl-raw-options=cookies-from-browser=...' into dict
+                try:
+                    val = cookies_browser
+                    if cookies_keyring:
+                        val += f"+{cookies_keyring}"
+                    if cookies_profile or cookies_container:
+                        val += f":{cookies_profile}"
+                    if cookies_container:
+                        val += f"::{cookies_container}"
+                    raw_opts["cookies-from-browser"] = val
+                except Exception:
+                    pass
+            if http_proxy:
+                raw_opts["proxy"] = http_proxy
+            try:
+                self.mpv_widget.set_ytdl_raw_options(raw_opts)
+            except Exception:
+                pass
+            ok = self.mpv_widget.play(video.url)
+            if ok:
+                log.debug("Embedded playback started successfully")
+                if self._on_started_callback:
+                    self._on_started_callback("embedded")
+                return True
+            else:
+                log.debug("Embedded playback failed, falling back to external")
+        else:
+            log.debug("Using external playback mode")
+
+        # External MPV playback
+        if not has_mpv():
+            log.error("MPV not found in PATH")
+            return False
+
+        # Proxy for mpv/yt-dlp
+        extra_env = {}
+        if http_proxy:
+            extra_env["http_proxy"] = http_proxy
+            extra_env["https_proxy"] = http_proxy
+
+        # Unique IPC path per launch to avoid collisions
+        rnd = secrets.token_hex(4)
+        ipc_dir = Path(tempfile.gettempdir())
+        ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
+
+        # Optional: write mpv logs to /tmp when WHIRLTUBE_DEBUG=1
+        log_file = None
+        if os.environ.get("WHIRLTUBE_DEBUG"):
+            log_file = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.log")
+
+        log.debug("Launching mpv: args=%s proxy=%s", final_mpv_args_list, bool(http_proxy))
+        
+        try:
+            proc = start_mpv(
+                video.url,
+                extra_args=final_mpv_args_list,
+                ipc_server_path=ipc_path,
+                extra_env=extra_env,
+                log_file_path=log_file,
+            )
+
+            # Store for later cleanup and control
+            self._proc = proc
+            self._ipc = ipc_path
+            self._current_url = video.url
+            self._speed = 1.0
+            
+            if self._on_started_callback:
+                self._on_started_callback("external")
+
+            # Watcher thread: cleanup on exit
+            def _watch():
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                GLib.idle_add(self._on_external_mpv_exit)
+            
+            threading.Thread(target=_watch, daemon=True).start()
+            return True
+        except Exception as e:
+            log.error("Failed to start mpv: %s", e)
+            if os.environ.get("WHIRLTUBE_DEBUG") and log_file:
+                log.error(f"Failed to start mpv. See log: {log_file}")
+            else:
+                log.error("Failed to start mpv. See logs for details.")
+            return False
+
+    def _build_cookie_arg(self, browser: str, keyring: str, profile: str, container: str) -> str:
+        if not browser:
+            return ""
+        val = browser
+        if keyring:
+            val += f"+{keyring}"
+        if profile or container:
+            val += f":{profile}"
+        if container:
+            val += f"::{container}"
+        return f'--ytdl-raw-options=cookies-from-browser={val}'
+
+    def _on_external_mpv_exit(self) -> None:
+        """Called when external MPV process exits"""
+        # Clean up the IPC socket file
+        try:
+            if self._ipc and os.path.exists(self._ipc):
+                os.remove(self._ipc)
+        except OSError as e:
+            log.warning("Failed to remove mpv IPC socket %s: %s", self._ipc or "", e)
+
+        self._proc = None
+        self._ipc = None
+        self._current_url = None
+        
+        if self._on_stopped_callback:
+            self._on_stopped_callback()
+
+    def is_running(self) -> bool:
+        """Check if any MPV player is running (external or embedded)"""
+        if self._proc is not None:
+            # Check if the process is still alive
+            if self._proc.poll() is None:
+                return True
+            else:
+                # Process died, clean up
+                self._cleanup_external()
+                return False
+        # Check if embedded player is ready
+        return self.mpv_widget.is_ready
+
+    def _cleanup_external(self):
+        """Clean up external MPV resources"""
+        if self._ipc and os.path.exists(self._ipc):
+            try:
+                os.remove(self._ipc)
+            except OSError:
+                pass
+        self._proc = None
+        self._ipc = None
+        self._current_url = None
+
+    def cycle_pause(self):
+        """Toggle play/pause for external MPV or embedded"""
+        if self._ipc:
+            mpv_send_cmd(self._ipc, ["cycle", "pause"])
+        else:
+            # Embedded path
+            try:
+                self.mpv_widget.pause_toggle()
+            except Exception:
+                pass
+
+    def seek(self, secs: int):
+        """Seek for external MPV or embedded"""
+        if self._ipc:
+            mpv_send_cmd(self._ipc, ["seek", secs, "relative"])
+        else:
+            try:
+                self.mpv_widget.seek(secs)
+            except Exception:
+                pass
+
+    def change_speed(self, delta: float):
+        """Change playback speed for external MPV or embedded"""
+        if self._ipc:
+            try:
+                self._speed = max(0.1, min(4.0, self._speed + delta))
+            except Exception:
+                self._speed = 1.0
+            mpv_send_cmd(self._ipc, ["set_property", "speed", round(self._speed, 2)])
+        else:
+            # embedded
+            try:
+                self._speed = max(0.1, min(4.0, self._speed + delta))
+            except Exception:
+                self._speed = 1.0
+            try:
+                self.mpv_widget.set_speed(self._speed)
+            except Exception:
+                pass
+
+    def stop(self):
+        """Stop external MPV or embedded"""
+        # Embedded stop
+        if not self._ipc:
+            try:
+                self.mpv_widget.stop()
+            except Exception:
+                pass
+            return
+        # External path: prefer quit over kill where possible
+        if self._ipc:
+            mpv_send_cmd(self._ipc, ["quit"])
+        proc = self._proc
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._proc = None
+        self._ipc = None
+
+    def copy_timestamp(self) -> str | None:
+        """Get current timestamp for external MPV or embedded and return URL with timestamp"""
+        pos = 0
+        if self._ipc:
+            # Ask external mpv for current playback position
+            try:
+                resp = mpv_send_cmd(self._ipc, ["get_property", "time-pos"])
+                if isinstance(resp, dict) and "data" in resp:
+                    v = resp.get("data")
+                    if isinstance(v, (int, float)):
+                        pos = int(v)
+            except Exception:
+                pos = 0
+        else:
+            # Embedded mpv
+            try:
+                pos = int(self.mpv_widget.current_time())
+            except Exception:
+                pos = 0
+        
+        url = self._current_url or ""
+        if not url and self._ipc:
+            # Try to get from MPV path property as fallback
+            try:
+                resp2 = mpv_send_cmd(self._ipc, ["get_property", "path"])
+                if isinstance(resp2, dict) and isinstance(resp2.get("data"), str):
+                    url = str(resp2["data"])
+            except Exception:
+                pass
+        
+        if not url:
+            return None
+        
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}t={pos}s"
+
+    def copy_timestamp_to_clipboard(self) -> bool:
+        """Copy the current timestamp URL to clipboard"""
+        timestamp_url = self.copy_timestamp()
+        if timestamp_url:
+            try:
+                disp = Gdk.Display.get_default()
+                if disp:
+                    disp.get_clipboard().set_text(timestamp_url)
+                return True
+            except Exception:
+                try:
+                    disp = Gdk.Display.get_default()
+                    if disp:
+                        disp.get_primary_clipboard().set_text(timestamp_url)
+                    return True
+                except Exception:
+                    pass
+        return False
+
+    def cleanup(self):
+        """Cleanup all resources"""
+        if self._proc:
+            try:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+            except Exception:
+                pass
+        if self._ipc and os.path.exists(self._ipc):
+            try:
+                os.remove(self._ipc)
+            except Exception:
+                pass
+        self._proc = None
+        self._ipc = None
+        self._current_url = None

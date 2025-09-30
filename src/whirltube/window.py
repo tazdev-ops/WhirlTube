@@ -5,7 +5,6 @@ import os
 import tempfile
 import shlex
 import secrets
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
@@ -21,15 +20,19 @@ from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
 from .history import add_search_term, add_watch, list_watch
 from .models import Video
 from .mpv_embed import MpvWidget
-from .player import has_mpv, start_mpv, mpv_send_cmd, mpv_supports_option
-from .provider import YTDLPProvider
-from .invidious_provider import InvidiousProvider
+from .providers.ytdlp import YTDLPProvider
+from .providers.invidious import InvidiousProvider
 from .download_manager import DownloadManager
 from .search_filters import normalize_search_filters
 from .navigation_controller import NavigationController
 from .download_history import list_downloads
 from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
 from .quickdownload import QuickDownloadWindow
+from .ui.widgets.result_row import ResultRow
+from .ui.widgets.mpv_controls import MpvControls
+from .services.playback import PlaybackService
+from .ui.controllers import search
+from .metrics import timed
 from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy, is_valid_youtube_url
 
 import gi
@@ -41,6 +44,13 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+
+THUMB_SIZE = (160, 90)
+DEFAULT_SEARCH_LIMIT = 30
+DEFAULT_WATCH_HISTORY = 200
+DEFAULT_DOWNLOAD_HISTORY = 300
+MAX_THUMB_WORKERS = 4
+FEED_VIDEOS_PER_CHANNEL = 5
 
 log = logging.getLogger(__name__)
 
@@ -77,13 +87,15 @@ class MainWindow(Adw.ApplicationWindow):
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
         self.settings.setdefault("win_h", 740)
+        
         # Initialize provider with global proxy and optional Invidious
         proxy = (self.settings.get("http_proxy") or "").strip() or None
         if bool(self.settings.get("use_invidious")):
             base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
-            self.provider: YTDLPProvider | InvidiousProvider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+            self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
         else:
-            self.provider: YTDLPProvider | InvidiousProvider = YTDLPProvider(proxy or None)
+            self.provider = YTDLPProvider(proxy or None)
+        
         # Pass cookies to provider as well (helps trending/region walls)
         try:
             if isinstance(self.provider, YTDLPProvider):
@@ -93,7 +105,7 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception:
             pass
         self._search_generation = 0
-        self._thumb_loader_pool = ThreadPoolExecutor(max_workers=4)
+        self._thumb_loader_pool = ThreadPoolExecutor(max_workers=MAX_THUMB_WORKERS)
         
         # ToolbarView
         self.toolbar_view = Adw.ToolbarView()
@@ -102,38 +114,18 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         self.toolbar_view.add_top_bar(header)
         
-        # MPV control bar (hidden by default; shown for external MPV)
-        self.ctrl_bar = Adw.HeaderBar()
-        self.ctrl_bar.set_title_widget(Gtk.Label(label="MPV Controls", css_classes=["dim-label"]))
-        # Toast overlay wrappers the whole UI
+        # Initialize MPV controls widget and service
+        self.mpv_widget = MpvWidget()
+        self.playback_service = PlaybackService(self.mpv_widget)
+        self.mpv_controls = MpvControls(self.playback_service)
+        
+        # Add the MPV control bar as a top bar
+        self.toolbar_view.add_top_bar(self.mpv_controls.get_ctrl_bar())
+        self.mpv_controls.get_ctrl_bar().set_visible(False)
+        
+        # Toast overlay wraps the whole UI
         self.toast_overlay = Adw.ToastOverlay()
         self.set_content(self.toast_overlay)
-        # Buttons: Seek -10, Play/Pause, Seek +10, Speed -, Speed +, Stop
-        self.btn_seek_back = Gtk.Button(icon_name="media-seek-backward-symbolic")
-        self.btn_play_pause = Gtk.Button(icon_name="media-playback-pause-symbolic")
-        self.btn_seek_fwd = Gtk.Button(icon_name="media-seek-forward-symbolic")
-        self.btn_speed_down = Gtk.Button(label="Speed -")
-        self.btn_speed_up = Gtk.Button(label="Speed +")
-        self.btn_stop_mpv = Gtk.Button(icon_name="media-playback-stop-symbolic")
-        self.btn_seek_back.connect("clicked", lambda *_: self._mpv_seek(-10))
-        self.btn_play_pause.connect("clicked", lambda *_: self._mpv_cycle_pause())
-        self.btn_seek_fwd.connect("clicked", lambda *_: self._mpv_seek(10))
-        self.btn_speed_down.connect("clicked", lambda *_: self._mpv_speed_delta(-0.1))
-        self.btn_speed_up.connect("clicked", lambda *_: self._mpv_speed_delta(0.1))
-        self.btn_copy_ts = Gtk.Button(icon_name="edit-copy-symbolic")
-        self.btn_copy_ts.set_tooltip_text("Copy URL at current time (T)")
-        self.btn_copy_ts.connect("clicked", lambda *_: self._mpv_copy_ts())
-        self.btn_stop_mpv.connect("clicked", lambda *_: self._mpv_stop())
-        # Pack controls on the right
-        self.ctrl_bar.pack_end(self.btn_stop_mpv)
-        self.ctrl_bar.pack_end(self.btn_copy_ts)
-        self.ctrl_bar.pack_end(self.btn_speed_up)
-        self.ctrl_bar.pack_end(self.btn_speed_down)
-        self.ctrl_bar.pack_end(self.btn_seek_fwd)
-        self.ctrl_bar.pack_end(self.btn_play_pause)
-        self.ctrl_bar.pack_end(self.btn_seek_back)
-        self.toolbar_view.add_top_bar(self.ctrl_bar)
-        self.ctrl_bar.set_visible(False)
         
         # Back button (NavigationController will connect it)
         self.btn_back = Gtk.Button(icon_name="go-previous-symbolic")
@@ -152,6 +144,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Cancel All Downloads", "win.cancel_all_downloads")
         menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
         menu.append("Copy URL @ time", "win.mpv_copy_ts")
+        menu.append("System Health Check", "win.health_check")
         menu.append("Stop MPV", "win.stop_mpv")
         menu.append("Quit", "app.quit")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
@@ -160,32 +153,38 @@ class MainWindow(Adw.ApplicationWindow):
         
         # Quick actions (left)
         self.btn_open = Gtk.Button(label="Open URL…")
+        self.btn_open.set_can_focus(True)
         self.btn_open.set_tooltip_text("Open any YouTube URL (video/playlist/channel)")
         self.btn_open.connect("clicked", self._on_open_url)
         header.pack_start(self.btn_open)
-
+        
         self.btn_hist = Gtk.Button(label="History")
+        self.btn_hist.set_can_focus(True)
         self.btn_hist.set_tooltip_text("Watch history")
         self.btn_hist.connect("clicked", self._on_history)
         header.pack_start(self.btn_hist)
-
+        
         self.btn_feed = Gtk.Button(label="Feed")
+        self.btn_feed.set_can_focus(True)
         self.btn_feed.set_tooltip_text("Recent from followed channels")
         self.btn_feed.connect("clicked", self._on_feed)
         header.pack_start(self.btn_feed)
-
+        
         self.btn_trending = Gtk.Button(label="Trending")
+        self.btn_trending.set_can_focus(True)
         self.btn_trending.set_tooltip_text("YouTube trending now")
         self.btn_trending.connect("clicked", self._on_trending)
         header.pack_start(self.btn_trending)
-
+        
         self.btn_qdl = Gtk.Button(label="Quick Download")
+        self.btn_qdl.set_can_focus(True)
         self.btn_qdl.set_tooltip_text("Batch download multiple URLs")
         self.btn_qdl.connect("clicked", self._on_quick_download)
         header.pack_start(self.btn_qdl)
-
+        
         # Search
         self.search = Gtk.SearchEntry(hexpand=True)
+        self.search.set_can_focus(True)
         self.search.set_placeholder_text("Search YouTube…")
         header.set_title_widget(self.search)
         self.search.connect("activate", self._on_search_activate)
@@ -200,6 +199,7 @@ class MainWindow(Adw.ApplicationWindow):
         
         # Filters popover
         self.btn_filters = Gtk.MenuButton(icon_name="view-list-symbolic")
+        self.btn_filters.set_can_focus(True)
         self.btn_filters.set_tooltip_text("Search filters")
         header.pack_end(self.btn_filters)
         self._filters_pop = Gtk.Popover()
@@ -232,6 +232,7 @@ class MainWindow(Adw.ApplicationWindow):
         
         # Downloads toggle
         self.downloads_button = Gtk.Button(label="Downloads")
+        self.downloads_button.set_can_focus(True)
         self.downloads_button.connect("clicked", self._show_downloads)
         header.pack_end(self.downloads_button)
 
@@ -271,7 +272,6 @@ class MainWindow(Adw.ApplicationWindow):
         # Player (embedded mpv)
         self.player_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._set_margins(self.player_box, 0)
-        self.mpv_widget = MpvWidget()
         self.player_box.append(self.mpv_widget)
         self.stack.add_titled(self.player_box, "player", "Player")
 
@@ -304,20 +304,52 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_welcome()
         self._install_shortcuts()
 
-        # MPV actions (menu + hotkeys)
-        self._install_mpv_actions()
+        # MPV actions (menu + hotkeys) - now using controls widget
+        self.mpv_controls.add_actions_to_window(self)
         self._install_key_controller()
+        self.playback_service.set_callbacks(
+            on_started=self._on_mpv_started,
+            on_stopped=self._on_mpv_stopped
+        )
+
+        # MPV actions (menu + hotkeys) - set up accelerators
+        app_obj = self.get_application()
+        if app_obj:
+            self.mpv_controls.install_accelerators(app_obj)
 
         # Track current URL for timestamp copying
         self._mpv_current_url: str | None = None
-
-        # MPV external player state
-        self._mpv_proc: subprocess.Popen | None = None
-        self._mpv_ipc: str | None = None
-        self._mpv_speed = 1.0
+        self._last_filters: dict[str, str] | None = None
 
         # Save settings on window close
         self.connect("close-request", self._on_main_close)
+        
+
+        
+        # Add Ctrl+F to focus search
+        focus_search = Gio.SimpleAction.new("focus_search", None)
+        focus_search.connect("activate", lambda *_: self.search.grab_focus())
+        self.add_action(focus_search)
+        app = self.get_application()
+        if app:
+            app.set_accels_for_action("win.focus_search", ["<Primary>F"])
+
+    def _on_mpv_started(self, mode: str):
+        """Called when MPV playback starts"""
+        self.mpv_controls.get_ctrl_bar().set_visible(self._is_mpv_controls_visible())
+        try:
+            self._mpv_stop_action.set_enabled(True)
+        except AttributeError:
+            pass  # _mpv_stop_action may not be set in all contexts
+
+    def _on_mpv_stopped(self):
+        """Called when MPV playback stops"""
+        self.mpv_controls.get_ctrl_bar().set_visible(False)
+        try:
+            self._mpv_stop_action.set_enabled(False)
+        except AttributeError:
+            pass
+
     def _show_toast(self, text: str) -> None:
         try:
             self.toast_overlay.add_toast(Adw.Toast.new(text))
@@ -342,75 +374,10 @@ class MainWindow(Adw.ApplicationWindow):
         w.set_margin_start(px)
         w.set_margin_end(px)
 
-    def _install_mpv_actions(self) -> None:
-        # Define actions
-        a_play_pause = Gio.SimpleAction.new("mpv_play_pause", None)
-        a_play_pause.connect("activate", lambda *_: self._mpv_cycle_pause())
-        self.add_action(a_play_pause)
-
-        a_seek_back = Gio.SimpleAction.new("mpv_seek_back", None)
-        a_seek_back.connect("activate", lambda *_: self._mpv_seek(-10))
-        self.add_action(a_seek_back)
-
-        a_seek_fwd = Gio.SimpleAction.new("mpv_seek_fwd", None)
-        a_seek_fwd.connect("activate", lambda *_: self._mpv_seek(10))
-        self.add_action(a_seek_fwd)
-
-        a_speed_down = Gio.SimpleAction.new("mpv_speed_down", None)
-        a_speed_down.connect("activate", lambda *_: self._mpv_speed_delta(-0.1))
-        self.add_action(a_speed_down)
-
-        a_speed_up = Gio.SimpleAction.new("mpv_speed_up", None)
-        a_speed_up.connect("activate", lambda *_: self._mpv_speed_delta(0.1))
-        self.add_action(a_speed_up)
-
-        a_copy_ts = Gio.SimpleAction.new("mpv_copy_ts", None)
-        a_copy_ts.connect("activate", lambda *_: self._mpv_copy_ts())
-        self.add_action(a_copy_ts)
-
-        a_stop = Gio.SimpleAction.new("stop_mpv", None)
-        a_stop.connect("activate", lambda *_: self._mpv_stop())
-        a_stop.set_enabled(False)  # only enabled when mpv running
-        self.add_action(a_stop)
-        self._act_stop_mpv = a_stop
-
-        # Install accelerators
-        app = self.get_application()
-        if not app:
-            return
-        # YouTube-like keys: j/k/l and +/- for speed, x to stop
-        app.set_accels_for_action("win.mpv_play_pause", ["K", "k"])
-        app.set_accels_for_action("win.mpv_seek_back", ["J", "j"])
-        app.set_accels_for_action("win.mpv_seek_fwd", ["L", "l"])
-        app.set_accels_for_action("win.mpv_speed_down", ["minus", "KP_Subtract"])
-        app.set_accels_for_action("win.mpv_speed_up", ["equal", "KP_Add"])
-        app.set_accels_for_action("win.mpv_copy_ts", ["T", "t"])
-        app.set_accels_for_action("win.stop_mpv", ["X", "x"])
-
     def _install_key_controller(self) -> None:
         ctrl = Gtk.EventControllerKey()
         def on_key(_c, keyval, keycode, state):
-            # Only handle when MPV is running
-            if self._mpv_proc is None:
-                return False
-            k = Gdk.keyval_name(keyval) or ""
-            k = k.lower()
-            handled = False
-            if k == "j":
-                self._mpv_seek(-10); handled = True
-            elif k == "k":
-                self._mpv_cycle_pause(); handled = True
-            elif k == "l":
-                self._mpv_seek(10); handled = True
-            elif k in ("minus", "kp_subtract"):
-                self._mpv_speed_delta(-0.1); handled = True
-            elif k in ("equal", "kp_add", "plus"):
-                self._mpv_speed_delta(0.1); handled = True
-            elif k == "x":
-                self._mpv_stop(); handled = True
-            elif k == "t":
-                self._mpv_copy_ts(); handled = True
-            return handled
+            return self.mpv_controls.handle_key_press(keyval, keycode, state)
         ctrl.connect("key-pressed", on_key)
         self.add_controller(ctrl)
 
@@ -447,6 +414,10 @@ class MainWindow(Adw.ApplicationWindow):
         clear_fin.connect("activate", lambda *_: self.download_manager.clear_finished())
         self.add_action(clear_fin)
 
+        health = Gio.SimpleAction.new("health_check", None)
+        health.connect("activate", self._on_health_check)
+        self.add_action(health)
+
         # Subscriptions actions (menu entries exist, actions were missing)
         subs = Gio.SimpleAction.new("subscriptions", None)
         subs.connect("activate", self._on_subscriptions)
@@ -460,7 +431,7 @@ class MainWindow(Adw.ApplicationWindow):
         subs_export.connect("activate", self._on_subs_export)
         self.add_action(subs_export)
 
-    def _show_loading(self, message: str) -> None:
+    def _show_loading(self, message: str, cancellable: bool = False) -> None:
         # Clear results and show a centered spinner + message
         self._clear_results()
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -470,8 +441,18 @@ class MainWindow(Adw.ApplicationWindow):
         spinner.start()
         row.append(spinner)
         row.append(Gtk.Label(label=message))
+        
+        if cancellable:
+            btn_cancel = Gtk.Button(label="Cancel")
+            btn_cancel.connect("clicked", lambda *_: self._cancel_loading())
+            row.append(btn_cancel)
+            
         self.results_box.append(row)
         self.navigation_controller.show_view("results")
+
+    def _cancel_loading(self):
+        self._search_generation += 1  # Invalidate current search
+        self._set_welcome()
 
     def _on_shortcuts(self, *_a) -> None:
         # Create a ShortcutsWindow describing common keybindings
@@ -520,9 +501,43 @@ class MainWindow(Adw.ApplicationWindow):
         dlg.present(self)
 
     def _on_download_history(self, *_a) -> None:
-        vids = list_downloads(limit=300)
+        vids = list_downloads(limit=DEFAULT_DOWNLOAD_HISTORY)
         self._populate_results(vids)
         self.navigation_controller.show_view("results")
+
+    def _on_health_check(self, *_a):
+        dlg = Adw.MessageDialog(
+            transient_for=self,
+            heading="System Health Check",
+            body=self._run_health_checks()
+        )
+        dlg.add_response("ok", "OK")
+        dlg.present()
+
+    def _run_health_checks(self) -> str:
+        checks = []
+        
+        # MPV
+        from .player import has_mpv
+        checks.append(f"✓ MPV: {has_mpv()}")
+        
+        # Proxy
+        proxy = self.settings.get("http_proxy")
+        if proxy:
+            # Need to import safe_httpx_proxy from util
+            from .util import safe_httpx_proxy
+            valid = safe_httpx_proxy(proxy, test=True)
+            checks.append(f"{'✓' if valid else '✗'} Proxy: {proxy}")
+        else:
+            checks.append("✓ Proxy: (none configured)")
+        
+        # Provider
+        checks.append(f"✓ Provider: {type(self.provider).__name__}")
+        
+        # Download dir
+        checks.append(f"✓ Download dir: {self.download_dir.exists()}")
+        
+        return "\n".join(checks)
 
     def _on_subscriptions(self, *_a) -> None:
         # Show followed channels as rows (channel-kind Video entries)
@@ -602,7 +617,7 @@ class MainWindow(Adw.ApplicationWindow):
             # Update concurrency at runtime
             self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
             # Update MPV controls visibility preference immediately
-            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+            self.mpv_controls.get_ctrl_bar().set_visible(self._is_mpv_controls_visible())
 
         win.connect("close-request", persist)
 
@@ -614,12 +629,15 @@ class MainWindow(Adw.ApplicationWindow):
             pass
         # Stop MPV if running
         try:
-            self._mpv_stop()
+            self.playback_service.stop()
         except Exception:
             pass
         # Shut down thumbnail loader pool
         try:
-            self._thumb_loader_pool.shutdown(wait=False, cancel_futures=True)
+            self._thumb_loader_pool.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            # Python < 3.9 doesn't have cancel_futures
+            self._thumb_loader_pool.shutdown(wait=False)
         except Exception:
             pass
 
@@ -655,45 +673,11 @@ class MainWindow(Adw.ApplicationWindow):
     # ---------- Header actions ----------
 
     def _on_open_url(self, *_a) -> None:
-        dlg = Gtk.Dialog(title="Open URL", transient_for=self, modal=True)
-        entry = Gtk.Entry()
-        entry.set_placeholder_text("Paste a YouTube URL (video/channel/playlist)…")
-        box = dlg.get_content_area()
-        box.append(entry)
-        dlg.add_button("Open", Gtk.ResponseType.OK)
-        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dlg.set_default_response(Gtk.ResponseType.OK)
-        dlg.present()
-
-        def on_response(d: Gtk.Dialog, resp):
-            try:
-                if resp == Gtk.ResponseType.OK:
-                    url = entry.get_text().strip()
-                    if url:
-                        # Allow Invidious host when "use_invidious" is enabled
-                        extra = []
-                        if bool(self.settings.get("use_invidious")):
-                            host = urlparse((self.settings.get("invidious_instance") or "").strip()).hostname
-                            if host:
-                                extra.append(host)
-                                # common subdomain case
-                                if not host.startswith("www."):
-                                    extra.append("www." + host)
-                        if not is_valid_youtube_url(url, extra):
-                            self._show_error("This doesn't look like a YouTube/Invidious URL.")
-                        else:
-                            # If this looks like a direct video URL, play immediately
-                            vid = self._extract_ytid_from_url(url)
-                            if vid:
-                                v = Video(id=vid, title=url, url=url, channel=None, duration=None, thumb_url=None, kind="video")
-                                self._play_video(v)
-                            else:
-                                # Otherwise open as a listing (playlist/channel/etc.)
-                                self._browse_url(url)
-            finally:
-                d.destroy()
-
-        dlg.connect("response", on_response)
+        from .ui.controllers.browse import open_url_dialog
+        open_url_dialog(
+            self, self.provider, self.navigation_controller,
+            self._extract_ytid_from_url, self._show_error, self._populate_results, self._play_video, self._show_loading
+        )
 
     def _extract_ytid_from_url(self, url: str) -> str | None:
         """
@@ -725,7 +709,7 @@ class MainWindow(Adw.ApplicationWindow):
         return None
 
     def _on_history(self, *_a) -> None:
-        vids = list_watch(limit=200)
+        vids = list_watch(limit=DEFAULT_WATCH_HISTORY)
         self._populate_results(vids)
         self.navigation_controller.show_view("results")
 
@@ -734,18 +718,17 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_feed(self, *_a) -> None:
         # Show loading, then fetch recent uploads from each followed channel
-        self._show_loading("Loading feed…")
+        self._show_loading("Loading feed…", cancellable=True)
 
         def worker():
             vids_all = []
             try:
                 subs = list_subscriptions()
-                per_chan = 5
                 for sub in subs:
                     try:
                         vids = self.provider.channel_tab(sub.url, "videos")
                         if vids:
-                            vids_all.extend(vids[:per_chan])
+                            vids_all.extend(vids[:FEED_VIDEOS_PER_CHANNEL])
                     except Exception:
                         continue
             except Exception:
@@ -754,7 +737,7 @@ class MainWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_trending(self, *_a) -> None:
-        self._show_loading("Loading trending…")
+        self._show_loading("Loading trending…", cancellable=True)
         def worker():
             try:
                 vids = self.provider.trending()
@@ -768,46 +751,34 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.idle_add(show)
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---------- Browse helpers ----------
-
-    def _browse_url(self, url: str) -> None:
-        self._show_loading(f"Opening: {url}")
-
-        def worker():
-            vids = self.provider.browse_url(url)
-            GLib.idle_add(self._populate_results, vids)
-
-        threading.Thread(target=worker, daemon=True).start()
+    # ---------- Search ----------
 
     # ---------- Search ----------
 
     def _on_search_activate(self, entry: Gtk.SearchEntry) -> None:
-        query = entry.get_text().strip()
-        if not query:
-            return
-        add_search_term(query)
-        self._run_search(query)
+        search.on_search_activate(entry, self._run_search)
 
     def _run_search(self, query: str) -> None:
-        log.info("Searching: %s", query)
-        self._show_loading(f"Searching: {query}")
+        search.run_search(
+            query=query,
+            provider=self.provider,
+            settings=self.settings,
+            search_generation=self._search_generation,
+            show_loading_func=self._show_loading,
+            show_error_func=self._show_error,
+            populate_results_func=self._populate_results,
+            set_search_generation_func=self._set_search_generation,
+            limit=DEFAULT_SEARCH_LIMIT,
+            last_filters=self._last_filters,
+            timed_func=timed,
+        )
 
-        gen = self._search_generation = self._search_generation + 1
-
-        def worker() -> None:
-            try:
-                # Normalize filters from settings to provider-friendly form
-                order, duration, period = normalize_search_filters(self.settings)
-                results = self.provider.search(query, limit=30, order=order, duration=duration, period=period)
-            except Exception as e:
-                log.exception("Search failed")
-                GLib.idle_add(self._show_error, f"Search failed: {e}")
-                return
-            if gen != self._search_generation:
-                return
-            GLib.idle_add(self._populate_results, results)
-
-        threading.Thread(target=worker, daemon=True).start()
+    def _set_search_generation(self, gen: int) -> int:
+        """Helper to update and return the new search generation counter."""
+        self._search_generation = gen
+        # Also store in settings for the controller to check
+        self.settings["_search_generation"] = gen
+        return gen
 
     def _show_error(self, msg: str) -> None:
         self._clear_results()
@@ -829,15 +800,15 @@ class MainWindow(Adw.ApplicationWindow):
                 video=v,
                 on_play=self._play_video,
                 on_download_opts=self._download_options,
-                on_open=self._open_item,
-                on_related=self._on_related,
-                on_comments=self._on_comments,
+                on_open=lambda video: self._open_item(video),
+                on_related=lambda video: self._on_related(video),
+                on_comments=lambda video: self._on_comments(video),
                 thumb_loader_pool=self._thumb_loader_pool,
                 http_proxy=(self.settings.get("http_proxy") or None),
                 on_follow=self._follow_channel,
                 on_unfollow=self._unfollow_channel,
                 followed=is_followed(v.url) if v.kind == "channel" else False,
-                on_open_channel=self._open_channel_from_video,
+                on_open_channel=lambda video: self._open_channel_from_video(video),
                 on_toast=self._show_toast,
             )
             self.results_box.append(row)
@@ -857,69 +828,36 @@ class MainWindow(Adw.ApplicationWindow):
     # ---------- Item actions ----------
 
     def _open_item(self, video: Video) -> None:
-        # For playlists/channels/comments: open URL to list inner entries or view.
-        if video.kind == "playlist":
-            self._open_playlist(video.url)
-        elif video.kind == "channel":
-            self._open_channel(video.url)
-        elif video.kind == "comment":
-            self._browse_url(video.url)
-        else:
-            self._play_video(video)
+        from .ui.controllers.browse import open_item
+        open_item(
+            video, self.provider, self.navigation_controller, self._show_error, 
+            self._populate_results, self._play_video, 
+            lambda url: self._open_playlist(url), 
+            lambda url: self._open_channel(url), self._show_loading
+        )
 
     def _open_playlist(self, url: str) -> None:
-        self._show_loading("Opening playlist…")
-
-        def worker():
-            vids = self.provider.playlist(url)
-            GLib.idle_add(self._populate_results, vids)
-
-        threading.Thread(target=worker, daemon=True).start()
+        from .ui.controllers.browse import open_playlist
+        open_playlist(url, self.provider, self.navigation_controller, self._show_error, self._populate_results, self._show_loading)
 
     def _open_channel(self, url: str) -> None:
-        self._show_loading("Opening channel…")
-
-        def worker():
-            vids = self.provider.channel_tab(url, "videos")
-            GLib.idle_add(self._populate_results, vids)
-
-        threading.Thread(target=worker, daemon=True).start()
+        from .ui.controllers.browse import open_channel
+        open_channel(url, self.provider, self.navigation_controller, self._show_error, self._populate_results, self._show_loading)
 
     def _on_related(self, video: Video) -> None:
-        self._show_loading(f"Related to: {video.title}")
-
-        def worker():
-            vids = self.provider.related(video.url)
-            GLib.idle_add(self._populate_results, vids)
-
-        threading.Thread(target=worker, daemon=True).start()
+        from .ui.controllers.browse import on_related
+        on_related(video, self.provider, self.navigation_controller, self._show_error, self._populate_results, self._show_loading)
 
     def _on_comments(self, video: Video) -> None:
-        self._show_loading(f"Comments for: {video.title}")
-
-        def worker():
-            vids = self.provider.comments(video.url, max_comments=100)
-            GLib.idle_add(self._populate_results, vids)
-
-        threading.Thread(target=worker, daemon=True).start()
+        from .ui.controllers.browse import on_comments
+        on_comments(video, self.provider, self.navigation_controller, self._show_error, self._populate_results, self._show_loading)
 
     def _open_channel_from_video(self, video: Video) -> None:
-        # Resolve channel URL from a video, then open channel view
-        self._show_loading(f"Opening channel for: {video.title}")
-        def worker():
-            try:
-                url = self.provider.channel_url_of(video.url)
-            except Exception:
-                url = None
-            if not url:
-                GLib.idle_add(self._show_error, "Unable to resolve channel for this video.")
-                return
-            # Reuse existing channel opener
-            def go():
-                self._open_channel(url)
-                return False
-            GLib.idle_add(go)
-        threading.Thread(target=worker, daemon=True).start()
+        from .ui.controllers.browse import open_channel_from_video
+        open_channel_from_video(
+            video, self.provider, self.navigation_controller, self._show_error, 
+            self._populate_results, lambda url: self._open_channel(url), self._show_loading
+        )
 
     def _play_video(self, video: Video) -> None:
         # Log that the function was called to help with debugging
@@ -930,192 +868,46 @@ class MainWindow(Adw.ApplicationWindow):
         mode = self.settings.get("playback_mode", "external")
         mpv_args = self.settings.get("mpv_args", "") or ""
         
-        # Detect Wayland/X11
-        session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
-        is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
-        log.debug("Play requested: url=%s mode=%s wayland=%s", video.url, mode, is_wayland)
-
-        # Embedded on Wayland? Fall back
-        if mode == "embedded" and is_wayland:
-            log.debug("Detected embedded mode on Wayland - falling back to external")
-            self._show_toast("In-window playback is X11-only. Using external player on Wayland.")
-            mode = "external"
-
         # Quality preset
-        q = (self.settings.get("mpv_quality") or "auto").strip()
-        if q and q != "auto":
-            try:
-                h = int(q)
-                ytdl_fmt = f'bv*[height<={h}]+ba/b[height<={h}]'
-                mpv_args = f'{mpv_args} --ytdl-format="{ytdl_fmt}"'.strip()
-            except Exception:
-                pass
-
-        # Optional cookies for playback
-        if self.settings.get("mpv_cookies_enable"):
-            cookie_arg = self._mpv_cookie_arg()
-            if cookie_arg:
-                mpv_args = f"{mpv_args} {cookie_arg}".strip()
-
-        # Add fullscreen option if enabled in settings
-        if bool(self.settings.get("mpv_fullscreen")):
-            mpv_args = f"{mpv_args} --fs".strip()
-
-        extra_platform_args: list[str] = []
-        # Wayland grouping (if mpv supports it)
-        if is_wayland and mpv_supports_option("wayland-app-id"):
-            extra_platform_args.append(f"--wayland-app-id={APP_ID}")
-
-        # X11 grouping via WM_CLASS (if supported)
-        if not is_wayland and mpv_supports_option("class"):
-            # Sets WM_CLASS (X11); harmless on Wayland builds that accept it
-            extra_platform_args.append(f"--class={APP_ID}")
-
-        try:
-            base_args = shlex.split(mpv_args)
-        except Exception:
-            log.warning("Failed to parse MPV args; launching without user args")
-            base_args = []
-        final_mpv_args_list = base_args + extra_platform_args
-
-        # Try embedded first only when actually allowed
-        if mode == "embedded":
-            log.debug("Attempting embedded playback")
-            ok = self.mpv_widget.play(video.url)
-            if ok:
-                log.debug("Embedded playback started successfully")
-                self.navigation_controller.show_view("player")
-                return
-            else:
-                log.debug("Embedded playback failed, falling back to external")
-        else:
-            log.debug("Using external playback mode")
-
-        if not has_mpv():
-            self._show_error("MPV not found in PATH.")
-            return
-
-        # Proxy for mpv/yt-dlp
-        extra_env = {}
-        proxy = (self.settings.get("http_proxy") or "").strip()
-        if proxy:
-            extra_env["http_proxy"] = proxy
-            extra_env["https_proxy"] = proxy
-
-        # Unique IPC path per launch to avoid collisions
-        rnd = secrets.token_hex(4)
-        ipc_dir = Path(tempfile.gettempdir())
-        ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
-
-        # Optional: write mpv logs to /tmp when WHIRLTUBE_DEBUG=1
-        log_file = None
-        if os.environ.get("WHIRLTUBE_DEBUG"):
-            log_file = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.log")
-
-        log.debug("Launching mpv: args=%s proxy=%s", final_mpv_args_list, bool(proxy))
-        # Log the actual command being executed for debugging
-        mpv_cmd_parts = ["mpv", "--force-window=yes"] 
-        if ipc_path:
-            mpv_cmd_parts.append(f"--input-ipc-server={ipc_path}")
-        if log_file:
-            mpv_cmd_parts.extend(["--msg-level=all=v", f"--log-file={log_file}"])
-        mpv_cmd_parts.extend(final_mpv_args_list)
-        mpv_cmd_parts.append(video.url)
-        log.debug("MPV command: %s", " ".join(shlex.quote(arg) for arg in mpv_cmd_parts))
-        if os.environ.get("WHIRLTUBE_DEBUG"):
-            # Show a simplified command in the toast to avoid overwhelming the user
-            simplified_cmd = ["mpv"] + [arg for arg in final_mpv_args_list if not arg.startswith("--input-ipc-server") and not arg.startswith("--log-file")] + [video.url]
-            self._show_toast(f"Launching mpv: {' '.join(shlex.quote(arg) for arg in simplified_cmd)}")
+        quality = (self.settings.get("mpv_quality") or "auto").strip()
         
-        try:
-            proc = start_mpv(
-                video.url,
-                extra_args=final_mpv_args_list,
-                ipc_server_path=ipc_path,
-                extra_env=extra_env,
-                log_file_path=log_file,
-            )
+        # Optional cookies for playback
+        cookies_enabled = self.settings.get("mpv_cookies_enable")
+        cookies_browser = self.settings.get("mpv_cookies_browser")
+        cookies_keyring = self.settings.get("mpv_cookies_keyring")
+        cookies_profile = self.settings.get("mpv_cookies_profile")
+        cookies_container = self.settings.get("mpv_cookies_container")
+        
+        http_proxy = (self.settings.get("http_proxy") or "").strip()
+        fullscreen = bool(self.settings.get("mpv_fullscreen"))
 
-            # Store for later cleanup and control
-            self._mpv_proc = proc
-            self._mpv_ipc = ipc_path
-            self._mpv_current_url = video.url
-            self._mpv_speed = 1.0
-            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
-            # Enable stop action (and implicitly other mpv actions if desired)
-            try:
-                self._act_stop_mpv.set_enabled(True)
-            except Exception:
-                pass
-
-            # Watcher thread: hide controls on exit
-            def _watch():
-                try:
-                    proc.wait()
-                except Exception:
-                    pass
-                GLib.idle_add(self._on_mpv_exit)
-            threading.Thread(target=_watch, daemon=True).start()
-        except Exception as e:
-            log.error("Failed to start mpv: %s", e)
-            if os.environ.get("WHIRLTUBE_DEBUG") and 'log_file' in locals() and log_file:
-                self._show_error(f"Failed to start mpv. See log: {log_file}")
-            else:
-                self._show_error("Failed to start mpv. See logs for details.")
-
-    def _on_mpv_exit(self) -> None:
-        # Clean up the IPC socket file
-        try:
-            if getattr(self, "_mpv_ipc", None) and os.path.exists(self._mpv_ipc):
-                os.remove(self._mpv_ipc)
-        except OSError as e:
-            log.warning("Failed to remove mpv IPC socket %s: %s", getattr(self, "_mpv_ipc", ""), e)
-
-        self._mpv_proc = None
-        self._mpv_ipc = None
-        self.ctrl_bar.set_visible(False)
-        try:
-            self._act_stop_mpv.set_enabled(False)
-        except Exception:
-            pass
-
-    def _mpv_copy_ts(self) -> None:
-        if not self._mpv_ipc:
-            return
-        # Ask mpv for current playback position
-        pos = 0
-        try:
-            resp = mpv_send_cmd(self._mpv_ipc, ["get_property", "time-pos"])
-            if isinstance(resp, dict) and "data" in resp:
-                v = resp.get("data")
-                if isinstance(v, (int, float)):
-                    pos = int(v)
-        except Exception:
-            pos = 0
-        url = self._mpv_current_url or ""
-        if not url:
-            # Try to get from MPV path property as fallback
-            try:
-                resp2 = mpv_send_cmd(self._mpv_ipc, ["get_property", "path"])
-                if isinstance(resp2, dict) and isinstance(resp2.get("data"), str):
-                    url = str(resp2["data"])
-            except Exception:
-                pass
-        if not url:
-            return
-        sep = "&" if "?" in url else "?"
-        stamped = f"{url}{sep}t={pos}s"
-        try:
-            disp = Gdk.Display.get_default()
-            if disp:
-                disp.get_clipboard().set_text(stamped)
-        except Exception:
-            pass
-        self._show_toast(f"Copied URL at {pos}s")
+        # Play using the playback service
+        success = self.playback_service.play(
+            video=video,
+            playback_mode=mode,
+            mpv_args=mpv_args,
+            quality=quality,
+            cookies_enabled=cookies_enabled,
+            cookies_browser=cookies_browser or "",
+            cookies_keyring=cookies_keyring or "",
+            cookies_profile=cookies_profile or "",
+            cookies_container=cookies_container or "",
+            http_proxy=http_proxy or None,
+            fullscreen=fullscreen
+        )
+        
+        if success and mode == "embedded":
+            # If embedded playback was successful, show the player view
+            self.navigation_controller.show_view("player")
+        
+        if success:
+            self._show_toast(f"Playing: {video.title}")
 
     def _is_mpv_controls_visible(self) -> bool:
+        if not hasattr(self, 'playback_service'):
+            return False
         # Only show controls if MPV running
-        if self._mpv_proc is None:
+        if not self.playback_service.is_running():
             return False
         # honor autohide preference: show only on player view when enabled
         if bool(self.settings.get("mpv_autohide_controls")):
@@ -1124,112 +916,30 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_stack_changed(self, *_a) -> None:
         try:
-            self.ctrl_bar.set_visible(self._is_mpv_controls_visible())
+            self.mpv_controls.get_ctrl_bar().set_visible(self._is_mpv_controls_visible())
         except Exception:
             pass
 
-    def _mpv_cookie_arg(self) -> str:
+    def _cookies_spec_for_ytdlp(self) -> str | None:
+        if not self.settings.get("mpv_cookies_enable"):
+            return None
         browser = (self.settings.get("mpv_cookies_browser") or "").strip()
         if not browser:
-            return ""
+            return None
         keyring = (self.settings.get("mpv_cookies_keyring") or "").strip()
         profile = (self.settings.get("mpv_cookies_profile") or "").strip()
         container = (self.settings.get("mpv_cookies_container") or "").strip()
+        
+        # Construct the specification string according to yt-dlp format: browser[+keyring][:profile][::container]
         val = browser
         if keyring:
             val += f"+{keyring}"
+        # Only add profile and container if they exist
         if profile or container:
-            val += f":{profile}"
+            val += f":{profile or ''}"
         if container:
             val += f"::{container}"
-        return f'--ytdl-raw-options=cookies-from-browser={val}'
-
-    def _mpv_cycle_pause(self) -> None:
-        if not self._mpv_ipc:
-            return
-        mpv_send_cmd(self._mpv_ipc, ["cycle", "pause"])
-
-    def _mpv_seek(self, secs: int) -> None:
-        if not self._mpv_ipc:
-            return
-        mpv_send_cmd(self._mpv_ipc, ["seek", secs, "relative"])
-
-    def _mpv_speed_delta(self, delta: float) -> None:
-        if not self._mpv_ipc:
-            return
-        try:
-            self._mpv_speed = max(0.1, min(4.0, self._mpv_speed + delta))
-        except Exception:
-            self._mpv_speed = 1.0
-        mpv_send_cmd(self._mpv_ipc, ["set_property", "speed", round(self._mpv_speed, 2)])
-
-    def _mpv_stop(self) -> None:
-        # Prefer quit over kill where possible
-        if self._mpv_ipc:
-            mpv_send_cmd(self._mpv_ipc, ["quit"])
-        proc = getattr(self, "_mpv_proc", None)
-        if proc:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        self._mpv_proc = None
-        self._mpv_ipc = None
-        self.ctrl_bar.set_visible(False)
-
-    def _filters_load_from_settings(self) -> None:
-        dur = (self.settings.get("search_duration") or "any").lower()
-        per = (self.settings.get("search_period") or "any").lower()
-        ordv = (self.settings.get("search_order") or "relevance").lower()
-        # Map to indices
-        dur_idx = {"any":0, "short":1, "medium":2, "long":3}.get(dur, 0)
-        per_idx = {"any":0, "today":1, "week":2, "month":3}.get(per, 0)
-        ord_idx = {"relevance":0, "date":1, "views":2}.get(ordv, 0)
-        try:
-            self.dd_dur.set_selected(dur_idx)
-            self.dd_period.set_selected(per_idx)
-            self.dd_order.set_selected(ord_idx)
-        except Exception:
-            pass
-
-    def _filters_apply(self, *_a) -> None:
-        # Save UI selections into settings and persist
-        dur_map = {0:"any", 1:"short", 2:"medium", 3:"long"}
-        per_map = {0:"any", 1:"today", 2:"week", 3:"month"}
-        ord_map = {0:"relevance", 1:"date", 2:"views"}
-        self.settings["search_duration"] = dur_map.get(self.dd_dur.get_selected(), "any")
-        self.settings["search_period"] = per_map.get(self.dd_period.get_selected(), "any")
-        self.settings["search_order"] = ord_map.get(self.dd_order.get_selected(), "relevance")
-        save_settings(self.settings)
-        self._filters_pop.popdown()
-        # If there is a current query, re-run search with new filters
-        try:
-            q = (self.search.get_text() or "").strip()
-            if q:
-                self._run_search(q)
-        except Exception:
-            pass
-
-    def _filters_clear(self, *_a) -> None:
-        self.settings["search_duration"] = "any"
-        self.settings["search_period"] = "any"
-        self.settings["search_order"] = "relevance"
-        save_settings(self.settings)
-        self._filters_load_from_settings()
-        # Optionally re-run current search after clearing
-        try:
-            q = (self.search.get_text() or "").strip()
-            if q:
-                self._run_search(q)
-        except Exception:
-            pass
+        return val
 
     # ---------- Downloads ----------
 
@@ -1269,349 +979,36 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception:
             pass
 
+    def _filters_load_from_settings(self) -> None:
+        search.filters_load_from_settings(
+            settings=self.settings,
+            dd_dur=self.dd_dur,
+            dd_period=self.dd_period,
+            dd_order=self.dd_order,
+        )
 
-class ResultRow(Gtk.Box):
-    def __init__(
-        self,
-        video: Video,
-        on_play: Callable[[Video], None],
-        on_download_opts: Callable[[Video], None],
-        on_open: Callable[[Video], None],
-        on_related: Callable[[Video], None],
-        on_comments: Callable[[Video], None],
-        thumb_loader_pool: ThreadPoolExecutor,
-        http_proxy: str | None = None,
-        on_follow: Callable[[Video], None] | None = None,
-        on_unfollow: Callable[[Video], None] | None = None,
-        followed: bool = False,
-        on_open_channel: Callable[[Video], None] | None = None,
-        on_toast: Callable[[str], None] | None = None,
-    ) -> None:
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.video = video
-        self.on_play = on_play
-        self.on_download_opts = on_download_opts
-        self.on_open = on_open
-        self.on_related = on_related
-        self.on_comments = on_comments
-        self.on_open_channel = on_open_channel
-        self.thumb_loader_pool = thumb_loader_pool
-        self.on_follow = on_follow
-        self.on_unfollow = on_unfollow
-        self._followed = followed
-        self._http_proxy = http_proxy
-        self.on_toast = on_toast
-        self._proxies = safe_httpx_proxy(http_proxy)
-
-        self.set_margin_top(6)
-        self.set_margin_bottom(6)
-
-        # Thumbnail stack with placeholder and image
-        self.thumb_stack = Gtk.Stack()
-        self.thumb_stack.set_size_request(160, 90)
+    def _filters_apply(self, *_a) -> None:
+        def set_last_filters(filters: dict[str, str]) -> None:
+            self._last_filters = filters
         
-        # Create placeholder widget once
-        self.thumb_placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.thumb_placeholder.set_size_request(160, 90)
-        self.thumb_placeholder.set_halign(Gtk.Align.FILL)
-        self.thumb_placeholder.set_valign(Gtk.Align.FILL)
-        lbl = Gtk.Label(label="No thumbnail")
-        lbl.set_halign(Gtk.Align.CENTER)
-        lbl.set_valign(Gtk.Align.CENTER)
-        lbl.add_css_class("dim-label")
-        lbl.set_wrap(True)
-        self.thumb_placeholder.append(lbl)
-        
-        # Create picture widget once
-        self.thumb = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
-        self.thumb.set_size_request(160, 90)
-        
-        # Add both to stack
-        self.thumb_stack.add_named(self.thumb_placeholder, "placeholder")
-        self.thumb_stack.add_named(self.thumb, "picture")
-        self.append(self.thumb_stack)
+        search.filters_apply(
+            settings=self.settings,
+            dd_dur=self.dd_dur,
+            dd_period=self.dd_period,
+            dd_order=self.dd_order,
+            filters_pop=self._filters_pop,
+            search_entry=self.search,
+            run_search_func=self._run_search,
+            set_last_filters_func=set_last_filters,
+        )
 
-        # Texts
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        title = Gtk.Label(label=video.title, wrap=True, xalign=0.0)
-        title.add_css_class("title-3")
-        meta = Gtk.Label(label=_fmt_meta(video), xalign=0.0)
-        meta.add_css_class("dim-label")
-        box.append(title)
-        box.append(meta)
-        self.append(box)
-
-        # Buttons
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        if video.is_playable:
-            play_btn = Gtk.Button(label="Play")
-            play_btn.connect("clicked", self._on_play_clicked)
-            dl_btn = Gtk.Button(label="Download…")
-            dl_btn.connect("clicked", self._on_download_clicked)
-            btn_box.append(play_btn)
-            btn_box.append(dl_btn)
-            # Compact "More…" menu
-            more = Gtk.MenuButton(label="More…")
-            pop = Gtk.Popover()
-            vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-            b_rel = Gtk.Button(label="Related")
-            b_rel.connect("clicked", lambda *_: self.on_related(self.video))
-            b_cmt = Gtk.Button(label="Comments")
-            b_cmt.connect("clicked", lambda *_: self.on_comments(self.video))
-            b_ch = Gtk.Button(label="Open channel")
-            b_ch.set_tooltip_text("Open the uploader's channel")
-            b_ch.connect("clicked", lambda *_: self.on_open_channel(self.video))
-            b_web = Gtk.Button(label="Open in Browser")
-            b_web.connect("clicked", lambda *_: self._open_in_browser())
-            b_cu = Gtk.Button(label="Copy URL")
-            b_cu.connect("clicked", lambda *_: self._copy_url())
-            b_ct = Gtk.Button(label="Copy Title")
-            b_ct.connect("clicked", lambda *_: self._copy_title())
-            for b in (b_rel, b_cmt, b_ch, b_web, b_cu, b_ct):
-                vbx.append(b)
-            pop.set_child(vbx)
-            more.set_popover(pop)
-            btn_box.append(more)
-        else:
-            # Non-playable kinds
-            if self.video.kind == "playlist":
-                open_btn = Gtk.Button(label="Open")
-                open_btn.set_tooltip_text("Open this playlist")
-                open_btn.connect("clicked", lambda *_: self.on_open(self.video))
-                btn_box.append(open_btn)
-                # Playlist may be downloaded (folder structure)
-                dl_btn = Gtk.Button(label="Download…")
-                dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
-                btn_box.append(dl_btn)
-            elif self.video.kind == "channel":
-                open_btn = Gtk.Button(label="Open")
-                open_btn.set_tooltip_text("Open this channel")
-                open_btn.connect("clicked", lambda *_: self.on_open(self.video))
-                btn_box.append(open_btn)
-                label = "Unfollow" if self._followed else "Follow"
-                follow_btn = Gtk.Button(label=label)
-                def _toggle_follow(_btn):
-                    try:
-                        if self._followed:
-                            if self.on_unfollow:
-                                self.on_unfollow(self.video)
-                            self._followed = False
-                            _btn.set_label("Follow")
-                            if self.on_toast:
-                                self.on_toast("Unfollowed channel")
-                        else:
-                            if self.on_follow:
-                                self.on_follow(self.video)
-                            self._followed = True
-                            _btn.set_label("Unfollow")
-                            if self.on_toast:
-                                self.on_toast("Followed channel")
-                    except Exception:
-                        pass
-                follow_btn.connect("clicked", _toggle_follow)
-                btn_box.append(follow_btn)
-            else:
-                # comment or other: no "Open" or "Download…" actions
-                pass
-            # Compact "More…" for common actions
-            more = Gtk.MenuButton(label="More…")
-            pop = Gtk.Popover()
-            vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-            b_web = Gtk.Button(label="Open in Browser")
-            b_web.connect("clicked", lambda *_: self._open_in_browser())
-            b_cu = Gtk.Button(label="Copy URL")
-            b_cu.connect("clicked", lambda *_: self._copy_url())
-            b_ct = Gtk.Button(label="Copy Title")
-            b_ct.connect("clicked", lambda *_: self._copy_title())
-            for b in (b_web, b_cu, b_ct):
-                vbx.append(b)
-            pop.set_child(vbx)
-            more.set_popover(pop)
-            btn_box.append(more)
-        self.append(btn_box)
-
-        # Load thumbnail
-        if video.thumb_url:
-            self.thumb_loader_pool.submit(self._load_thumb)
-        else:
-            # No URL -> placeholder
-            GLib.idle_add(self._set_thumb_placeholder)
-
-    def _on_play_clicked(self, *_a):
-        import logging
-        log = logging.getLogger("whirltube.window")
-        try:
-            log.debug("ResultRow Play clicked: %s (%s)", self.video.title, self.video.url)
-            if callable(self.on_play):
-                self.on_play(self.video)
-            else:
-                log.error("on_play is not callable: %r", self.on_play)
-        except Exception as e:
-            log.exception("on_play failed: %s", e)
-
-    def _on_download_clicked(self, *_a):
-        import logging
-        log = logging.getLogger("whirltube.window")
-        log.debug("ResultRow Download clicked: %s", self.video.title)
-        if callable(self.on_download_opts):
-            self.on_download_opts(self.video)
-
-    def _load_thumb(self) -> None:
-        # Try with proxy (if valid), then fallback without
-        data: bytes | None = None
-        try:
-            # For httpx 0.28.1+, use proxy parameter directly when _proxies is a string
-            if self._proxies:
-                with httpx.Client(timeout=10.0, follow_redirects=True, proxy=self._proxies, headers=HEADERS) as client:
-                    r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                    r.raise_for_status()
-                    data = r.content
-            else:
-                # No proxy configured
-                with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
-                    r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                    r.raise_for_status()
-                    data = r.content
-        except Exception:
-            data = None
-            # Fallback: retry without proxy if we had one
-            try:
-                with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client2:
-                    r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
-                    r2.raise_for_status()
-                    data = r2.content
-            except Exception:
-                data = None
-        if data is None:
-            GLib.idle_add(self._set_thumb_placeholder)
-            return
-        GLib.idle_add(self._set_thumb, data)
-
-    def _set_thumb(self, data: bytes) -> None:
-        # Check content type and convert WebP to JPEG if needed
-        try:
-            # First try to load directly
-            loader = GdkPixbuf.PixbufLoader()
-            loader.write(data)
-            loader.close()
-            pixbuf = loader.get_pixbuf()
-            
-            if pixbuf is None:
-                # If direct load fails, try to detect content type
-                if data.startswith(b'RIFF') and b'WEBP' in data[:12]:
-                    # This is a WebP image, try to convert it
-                    import io
-                    try:
-                        from PIL import Image
-                        img = Image.open(io.BytesIO(data))
-                        # Convert WebP to JPEG in memory
-                        output = io.BytesIO()
-                        img.convert('RGB').save(output, format='JPEG')
-                        jpeg_data = output.getvalue()
-                        
-                        # Now load the JPEG
-                        loader2 = GdkPixbuf.PixbufLoader()
-                        loader2.write(jpeg_data)
-                        loader2.close()
-                        pixbuf = loader2.get_pixbuf()
-                    except ImportError:
-                        # PIL not available, show placeholder
-                        self._set_thumb_placeholder()
-                        return
-                    except Exception:
-                        # Conversion failed, show placeholder
-                        self._set_thumb_placeholder()
-                        return
-            
-            if pixbuf:
-                # Check for tiny placeholder images (e.g. 1x1)
-                if pixbuf.get_width() < 10 or pixbuf.get_height() < 10:
-                    self._set_thumb_placeholder()
-                    return
-                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
-                self.thumb.set_paintable(texture)
-                # Show the picture in the stack
-                self.thumb_stack.set_visible_child_name("picture")
-                return
-        except Exception:
-            pass
-        # If decoding fails, show placeholder
-        self._set_thumb_placeholder()
-
-    def _set_thumb_placeholder(self) -> None:
-        # Show the placeholder in the stack
-        self.thumb_stack.set_visible_child_name("placeholder")
-
-    def _open_in_browser(self) -> None:
-        try:
-            if self.video and self.video.url:
-                Gio.AppInfo.launch_default_for_uri(self.video.url, None)
-        except Exception:
-            pass
-
-    def _copy_url(self) -> None:
-        text = self.video.url or ""
-        if not text:
-            return
-        def do_copy():
-            try:
-                disp = Gdk.Display.get_default()
-                if disp:
-                    try:
-                        disp.get_clipboard().set_text(text)
-                    except Exception:
-                        # best-effort fallback
-                        disp.get_primary_clipboard().set_text(text)
-                    if self.on_toast:
-                        self.on_toast("URL copied to clipboard")
-            except Exception:
-                pass
-            return False
-        GLib.idle_add(do_copy)
-
-    def _copy_title(self) -> None:
-        text = self.video.title or ""
-        if not text:
-            return
-        def do_copy():
-            try:
-                disp = Gdk.Display.get_default()
-                if disp:
-                    try:
-                        disp.get_clipboard().set_text(text)
-                    except Exception:
-                        # best-effort fallback
-                        disp.get_primary_clipboard().set_text(text)
-                    if self.on_toast:
-                        self.on_toast("Title copied to clipboard")
-            except Exception:
-                pass
-            return False
-        GLib.idle_add(do_copy)
-
-    def _cookies_spec_for_ytdlp(self) -> str | None:
-        if not self.settings.get("mpv_cookies_enable"):
-            return None
-        browser = (self.settings.get("mpv_cookies_browser") or "").strip()
-        if not browser:
-            return None
-        keyring = (self.settings.get("mpv_cookies_keyring") or "").strip()
-        profile = (self.settings.get("mpv_cookies_profile") or "").strip()
-        container = (self.settings.get("mpv_cookies_container") or "").strip()
-        val = browser + (f"+{keyring}" if keyring else "")
-        if profile or container:
-            val += f":{profile}"
-        if container:
-            val += f"::{container}"
-        return val
-
-def _fmt_meta(v: Video) -> str:
-    ch = v.channel or "Unknown channel"
-    dur = v.duration_str
-    base = f"{ch} • {dur}" if dur else ch
-    if v.kind in ("playlist", "channel"):
-        return f"{base} • {v.kind}"
-    return base
+    def _filters_clear(self, *_a) -> None:
+        search.filters_clear(
+            settings=self.settings,
+            load_filters_func=self._filters_load_from_settings,
+            search_entry=self.search,
+            run_search_func=self._run_search,
+        )
 
 
 def _spacer(px: int) -> Gtk.Box:

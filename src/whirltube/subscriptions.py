@@ -7,6 +7,9 @@ from typing import Any
 
 from .util import xdg_data_dir
 
+import logging
+log = logging.getLogger(__name__)
+
 _SUBS_PATH = xdg_data_dir() / "subscriptions.json"
 
 @dataclass(slots=True)
@@ -44,12 +47,18 @@ def list_subscriptions() -> list[Subscription]:
         out.append(Subscription(url=url, title=title))
     return out
 
+def _norm(u: str) -> str:
+    """Normalize URL by stripping trailing /videos from channel URLs."""
+    if "/channel/" in u and u.endswith("/videos"):
+        u = u[:-7]
+    return u.strip()
+
 def is_followed(url: str) -> bool:
-    u = (url or "").strip()
+    u = _norm(url or "")
     if not u:
         return False
     for it in _load_raw():
-        if (it.get("url") or "").strip() == u:
+        if _norm(it.get("url") or "") == u:
             return True
     return False
 
@@ -66,11 +75,11 @@ def add_subscription(url: str, title: str | None = None) -> bool:
     return True
 
 def remove_subscription(url: str) -> bool:
-    u = (url or "").strip()
+    u = _norm(url or "")
     if not u:
         return False
     data = _load_raw()
-    new = [it for it in data if (it.get("url") or "").strip() != u]
+    new = [it for it in data if _norm(it.get("url") or "") != u]
     if len(new) == len(data):
         return False
     _save_raw(new)

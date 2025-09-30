@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=WhirlTube
-Comment=Lightweight GTK4 frontend for YouTube using MPV + yt-dlp
-Exec=whirltube
-Icon=whirltube
-Terminal=false
-Categories=AudioVideo;Video;GTK;
-StartupNotify=true
