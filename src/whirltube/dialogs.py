@@ -573,6 +573,32 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_container.set_text(settings.get("mpv_cookies_container", ""))
         cookies_group.add(self.entry_container)
 
+        # SponsorBlock (Playback)
+        sb_group = Adw.PreferencesGroup(title="SponsorBlock (Playback)")
+        page_play.add(sb_group)
+
+        self.sb_enable = Adw.SwitchRow(title="Enable SponsorBlock during playback")
+        self.sb_enable.set_active(bool(settings.get("sb_playback_enable", False)))
+        sb_group.add(self.sb_enable)
+
+        self.sb_mode = Adw.ComboRow(
+            title="Action",
+            model=Gtk.StringList.new([
+                "Mark chapters",
+                "Auto-skip (if script present)",
+            ]),
+        )
+        mode_val = (settings.get("sb_playback_mode") or "mark").strip().lower()
+        self.sb_mode.set_selected(1 if mode_val in ("skip", "autoskip") else 0)
+        sb_group.add(self.sb_mode)
+
+        self.sb_categories = Adw.EntryRow(title="Categories (yt-dlp syntax)")
+        self.sb_categories.set_text(settings.get("sb_playback_categories", "default"))
+        self.sb_categories.set_tooltip_text(
+            "e.g. default, or sponsor,intro,outro. See yt-dlp --sponsorblock-mark help."
+        )
+        sb_group.add(self.sb_categories)
+
         # Provider group (Invidious)
         group_provider = Adw.PreferencesGroup(title="Invidious")
         page_provider.add(group_provider)
@@ -663,6 +689,12 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.settings["mpv_cookies_keyring"] = self.entry_keyring.get_text()
         self.settings["mpv_cookies_profile"] = self.entry_profile.get_text()
         self.settings["mpv_cookies_container"] = self.entry_container.get_text()
+        # SponsorBlock (Playback)
+        self.settings["sb_playback_enable"] = bool(self.sb_enable.get_active())
+        self.settings["sb_playback_mode"] = (
+            "skip" if int(self.sb_mode.get_selected() or 0) == 1 else "mark"
+        )
+        self.settings["sb_playback_categories"] = self.sb_categories.get_text().strip() or "default"
         # Global proxy
         self.settings["http_proxy"] = self.entry_proxy.get_text()
         # Concurrency

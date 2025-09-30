@@ -50,83 +50,87 @@ class PlaybackService:
         cookies_profile: str,
         cookies_container: str,
         http_proxy: str | None,
-        fullscreen: bool = False
+        fullscreen: bool = False,
+        sb_enabled: bool = False,
+        sb_mode: str = "mark",         # "mark" | "skip"
+        sb_categories: str = "default",
     ) -> bool:
-        """Play a video using either embedded or external MPV"""
         # Detect Wayland/X11
         session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
         is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 
-        # Quality preset
+        # Quality preset -> ytdl-format
         ytdl_fmt_val = None
         if quality and quality != "auto":
             try:
                 h = int(quality)
-                ytdl_fmt = f'bv*[height<={h}]+ba/b[height<={h}]'
-                ytdl_fmt_val = ytdl_fmt
+                ytdl_fmt_val = f'bv*[height<={h}]+ba/b[height<={h}]'
             except Exception:
                 pass
 
-        # Build MPV args for external player
+        # Build base mpv args
         mpv_args_list = []
         if mpv_args:
             try:
                 mpv_args_list = shlex.split(mpv_args)
             except Exception:
                 log.warning("Failed to parse MPV args; launching without user args")
-        
+
         if ytdl_fmt_val:
             mpv_args_list.append(f'--ytdl-format={ytdl_fmt_val}')
-        
+
+        # Build ytdl-raw-options map (cookies + sponsorblock + optional proxy)
+        ytdl_raw: dict[str, str] = {}
+
         if cookies_enabled:
-            cookie_arg = self._build_cookie_arg(cookies_browser, cookies_keyring, cookies_profile, cookies_container)
-            if cookie_arg:
-                mpv_args_list.append(cookie_arg)
-        
+            val = self._cookie_spec(cookies_browser, cookies_keyring, cookies_profile, cookies_container)
+            if val:
+                ytdl_raw["cookies-from-browser"] = val
+
+        # SponsorBlock for playback: mark chapters or auto-skip if script is present
+        sb_mode_l = (sb_mode or "mark").strip().lower()
+        if sb_enabled:
+            cats = (sb_categories or "default").strip()
+            # Escape commas for mpv CLI in case they appear (e.g., "all,-preview")
+            cats_cli = cats.replace(",", r"\,")
+            if sb_mode_l == "mark":
+                ytdl_raw["sponsorblock-mark"] = cats_cli
+            elif sb_mode_l in ("skip", "autoskip"):
+                # Best effort: still mark chapters for visibility
+                ytdl_raw["sponsorblock-mark"] = cats_cli
+                # And try to load sponsorblock.lua to auto-skip
+                sb_script = self._find_sponsorblock_script()
+                if sb_script:
+                    mpv_args_list.append(f"--script={sb_script}")
+                else:
+                    log.debug("SponsorBlock autoskip requested, but sponsorblock.lua not found; chapters will be marked only")
+
+        # Fullscreen
         if fullscreen:
             mpv_args_list.append("--fs")
 
         # Add platform-specific args
+        from ..player import mpv_supports_option
         extra_platform_args = []
-        # Wayland grouping (if mpv supports it)
-        from ..player import mpv_supports_option  # Import here to avoid circular reference initially
         if is_wayland and mpv_supports_option("wayland-app-id"):
             extra_platform_args.append(f"--wayland-app-id={APP_ID}")
-
-        # X11 grouping via WM_CLASS (if supported)
         if not is_wayland and mpv_supports_option("class"):
-            # Sets WM_CLASS (X11); harmless on Wayland builds that accept it
             extra_platform_args.append(f"--class={APP_ID}")
-
         final_mpv_args_list = mpv_args_list + extra_platform_args
 
-        # Try embedded first only when actually allowed
+        # Embedded path
         if playback_mode == "embedded":
             log.debug("Attempting embedded playback")
-            # Configure embedded mpv with format/cookies/proxy (mirrors external path)
-            # Build ytdl-format if needed
             try:
                 self.mpv_widget.set_ytdl_format(ytdl_fmt_val)
             except Exception:
                 pass
-            # ytdl-raw-options: cookies + proxy
-            raw_opts = {}
-            if cookies_enabled:
-                # Translate cookie arg string '--ytdl-raw-options=cookies-from-browser=...' into dict
-                try:
-                    val = cookies_browser
-                    if cookies_keyring:
-                        val += f"+{cookies_keyring}"
-                    if cookies_profile or cookies_container:
-                        val += f":{cookies_profile}"
-                    if cookies_container:
-                        val += f"::{cookies_container}"
-                    raw_opts["cookies-from-browser"] = val
-                except Exception:
-                    pass
-            if http_proxy:
-                raw_opts["proxy"] = http_proxy
+            # Pass ytdl-raw-options dict directly
             try:
+                # Add proxy to raw opts for embedded too
+                raw_opts = dict(ytdl_raw)
+                if http_proxy:
+                    raw_opts["proxy"] = http_proxy
                 self.mpv_widget.set_ytdl_raw_options(raw_opts)
             except Exception:
                 pass
@@ -141,29 +145,29 @@ class PlaybackService:
         else:
             log.debug("Using external playback mode")
 
-        # External MPV playback
+        # External MPV
         if not has_mpv():
             log.error("MPV not found in PATH")
             return False
 
-        # Proxy for mpv/yt-dlp
+        # Proxy env for mpv/ytdl
         extra_env = {}
         if http_proxy:
             extra_env["http_proxy"] = http_proxy
             extra_env["https_proxy"] = http_proxy
 
-        # Unique IPC path per launch to avoid collisions
+        # Unique IPC + optional log
         rnd = secrets.token_hex(4)
         ipc_dir = Path(tempfile.gettempdir())
         ipc_path = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.sock")
+        log_file = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.log") if os.environ.get("WHIRLTUBE_DEBUG") else None
 
-        # Optional: write mpv logs to /tmp when WHIRLTUBE_DEBUG=1
-        log_file = None
-        if os.environ.get("WHIRLTUBE_DEBUG"):
-            log_file = str(ipc_dir / f"whirltube-mpv-{os.getpid()}-{rnd}.log")
+        # Append combined ytdl-raw-options CLI (single arg) if any
+        ytdl_raw_cli = self._format_ytdl_raw_cli(ytdl_raw)
+        if ytdl_raw_cli:
+            final_mpv_args_list.append(f"--ytdl-raw-options={ytdl_raw_cli}")
 
         log.debug("Launching mpv: args=%s proxy=%s", final_mpv_args_list, bool(http_proxy))
-        
         try:
             proc = start_mpv(
                 video.url,
@@ -172,24 +176,18 @@ class PlaybackService:
                 extra_env=extra_env,
                 log_file_path=log_file,
             )
-
-            # Store for later cleanup and control
             self._proc = proc
             self._ipc = ipc_path
             self._current_url = video.url
             self._speed = 1.0
-            
             if self._on_started_callback:
                 self._on_started_callback("external")
-
-            # Watcher thread: cleanup on exit
             def _watch():
                 try:
                     proc.wait()
                 except Exception:
                     pass
                 GLib.idle_add(self._on_external_mpv_exit)
-            
             threading.Thread(target=_watch, daemon=True).start()
             return True
         except Exception as e:
@@ -200,7 +198,9 @@ class PlaybackService:
                 log.error("Failed to start mpv. See logs for details.")
             return False
 
-    def _build_cookie_arg(self, browser: str, keyring: str, profile: str, container: str) -> str:
+    # --- helpers ---
+
+    def _cookie_spec(self, browser: str, keyring: str, profile: str, container: str) -> str:
         if not browser:
             return ""
         val = browser
@@ -210,7 +210,75 @@ class PlaybackService:
             val += f":{profile}"
         if container:
             val += f"::{container}"
-        return f'--ytdl-raw-options=cookies-from-browser={val}'
+        return val
+
+    def _find_sponsorblock_script(self) -> str | None:
+        # Try common system/user locations
+        candidates = [
+            os.path.expanduser("~/.config/mpv/scripts/sponsorblock.lua"),
+            "/usr/share/mpv/scripts/sponsorblock.lua",
+            "/usr/local/share/mpv/scripts/sponsorblock.lua",
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _format_ytdl_raw_cli(self, opts: dict[str, str]) -> str:
+        """
+        Build a single --ytdl-raw-options value like:
+          cookies-from-browser=firefox,sponsorblock-mark=default
+        Values with commas are escaped as '\,' for mpv's parser.
+        """
+        parts = []
+        for k, v in opts.items():
+            if v is None:
+                continue
+            v = str(v)
+            if "," in v:
+                v = v.replace(",", r"\,")
+            parts.append(f"{k}={v}")
+        return ",".join(parts)
+
+    def _cookie_spec(self, browser: str, keyring: str, profile: str, container: str) -> str:
+        if not browser:
+            return ""
+        val = browser
+        if keyring:
+            val += f"+{keyring}"
+        if profile or container:
+            val += f":{profile}"
+        if container:
+            val += f"::{container}"
+        return val
+
+    def _find_sponsorblock_script(self) -> str | None:
+        # Try common system/user locations
+        candidates = [
+            os.path.expanduser("~/.config/mpv/scripts/sponsorblock.lua"),
+            "/usr/share/mpv/scripts/sponsorblock.lua",
+            "/usr/local/share/mpv/scripts/sponsorblock.lua",
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _format_ytdl_raw_cli(self, opts: dict[str, str]) -> str:
+        """
+        Build a single --ytdl-raw-options value like:
+          cookies-from-browser=firefox,sponsorblock-mark=default
+        Values with commas are escaped as '\,' for mpv's parser.
+        """
+        parts = []
+        for k, v in opts.items():
+            if v is None:
+                continue
+            v = str(v)
+            if "," in v:
+                v = v.replace(",", r"\,")
+            parts.append(f"{k}={v}")
+        return ",".join(parts)
 
     def _on_external_mpv_exit(self) -> None:
         """Called when external MPV process exits"""

@@ -20,6 +20,7 @@ from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
 from .history import add_search_term, add_watch, list_watch
 from .models import Video
 from .mpv_embed import MpvWidget
+from .mpv_gl import MpvGLWidget
 from .providers.ytdlp import YTDLPProvider
 from .providers.invidious import InvidiousProvider
 from .download_manager import DownloadManager
@@ -84,6 +85,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("mpv_autohide_controls", False)
         self.settings.setdefault("download_template", "%(title)s.%(ext)s")
         self.settings.setdefault("download_auto_open_folder", False)
+        # SponsorBlock settings
+        self.settings.setdefault("sb_playback_enable", False)
+        self.settings.setdefault("sb_playback_mode", "mark")  # mark | skip
+        self.settings.setdefault("sb_playback_categories", "default")
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
         self.settings.setdefault("win_h", 740)
@@ -115,7 +120,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.toolbar_view.add_top_bar(header)
         
         # Initialize MPV controls widget and service
-        self.mpv_widget = MpvWidget()
+        # Use GL-based widget for Wayland compatibility
+        self.mpv_widget = MpvGLWidget()
         self.playback_service = PlaybackService(self.mpv_widget)
         self.mpv_controls = MpvControls(self.playback_service)
         
@@ -881,6 +887,11 @@ class MainWindow(Adw.ApplicationWindow):
         http_proxy = (self.settings.get("http_proxy") or "").strip()
         fullscreen = bool(self.settings.get("mpv_fullscreen"))
 
+        # SponsorBlock settings
+        sb_enabled = bool(self.settings.get("sb_playback_enable"))
+        sb_mode = (self.settings.get("sb_playback_mode") or "mark").strip()
+        sb_categories = (self.settings.get("sb_playback_categories") or "default").strip()
+
         # Play using the playback service
         success = self.playback_service.play(
             video=video,
@@ -893,7 +904,10 @@ class MainWindow(Adw.ApplicationWindow):
             cookies_profile=cookies_profile or "",
             cookies_container=cookies_container or "",
             http_proxy=http_proxy or None,
-            fullscreen=fullscreen
+            fullscreen=fullscreen,
+            sb_enabled=sb_enabled,
+            sb_mode=sb_mode,
+            sb_categories=sb_categories,
         )
         
         if success and mode == "embedded":
