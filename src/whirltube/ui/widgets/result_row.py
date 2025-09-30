@@ -307,41 +307,46 @@ class ResultRow(Gtk.Box):
         text = self.video.url or ""
         if not text:
             return
-        def do_copy():
-            try:
-                disp = Gdk.Display.get_default()
-                if disp:
-                    try:
-                        disp.get_clipboard().set_text(text)
-                    except Exception:
-                        # best-effort fallback
-                        disp.get_primary_clipboard().set_text(text)
-                    if self.on_toast:
-                        self.on_toast("URL copied to clipboard")
-            except Exception:
-                pass
-            return False
-        GLib.idle_add(do_copy)
+        self._do_copy_text(text, "URL copied to clipboard")
 
     def _copy_title(self) -> None:
         text = self.video.title or ""
         if not text:
             return
-        def do_copy():
+        self._do_copy_text(text, "Title copied to clipboard")
+
+    def _do_copy_text(self, text: str, toast_msg: str) -> None:
+        """
+        Copy text to clipboard with Wayland-safe async handling.
+        Keeps a reference to the ContentProvider to avoid GC before paste.
+        """
+        def copy_on_main():
             try:
                 disp = Gdk.Display.get_default()
-                if disp:
-                    try:
-                        disp.get_clipboard().set_text(text)
-                    except Exception:
-                        # best-effort fallback
-                        disp.get_primary_clipboard().set_text(text)
-                    if self.on_toast:
-                        self.on_toast("Title copied to clipboard")
-            except Exception:
-                pass
+                if not disp:
+                    return False
+                clipboard = disp.get_clipboard()
+                
+                # Create a ContentProvider for text
+                # Store it as an instance variable so it doesn't get GC'd (Wayland needs this)
+                self._clipboard_provider = Gdk.ContentProvider.new_for_value(text)
+                clipboard.set_content(self._clipboard_provider)
+                
+                if self.on_toast:
+                    self.on_toast(toast_msg)
+            except Exception as e:
+                # Fallback: try the primary clipboard (X11 middle-click selection)
+                try:
+                    if disp:
+                        primary = disp.get_primary_clipboard()
+                        if primary:
+                            self._clipboard_provider_primary = Gdk.ContentProvider.new_for_value(text)
+                            primary.set_content(self._clipboard_provider_primary)
+                except Exception:
+                    pass
             return False
-        GLib.idle_add(do_copy)
+        
+        GLib.idle_add(copy_on_main)
 
 
 def _fmt_meta(v: Video) -> str:

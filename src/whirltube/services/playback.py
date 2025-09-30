@@ -357,22 +357,32 @@ class PlaybackService:
         return f"{url}{sep}t={pos}s"
 
     def copy_timestamp_to_clipboard(self) -> bool:
-        """Copy the current timestamp URL to clipboard"""
+        """Copy the current timestamp URL to clipboard (Wayland-safe)"""
         timestamp_url = self.copy_timestamp()
-        if timestamp_url:
+        if not timestamp_url:
+            return False
+        
+        try:
+            disp = Gdk.Display.get_default()
+            if not disp:
+                return False
+            clipboard = disp.get_clipboard()
+            
+            # Store provider to avoid GC on Wayland
+            self._clipboard_provider = Gdk.ContentProvider.new_for_value(timestamp_url)
+            clipboard.set_content(self._clipboard_provider)
+            return True
+        except Exception:
+            # Fallback to primary
             try:
-                disp = Gdk.Display.get_default()
                 if disp:
-                    disp.get_clipboard().set_text(timestamp_url)
+                    primary = disp.get_primary_clipboard()
+                    if primary:
+                        self._clipboard_provider_primary = Gdk.ContentProvider.new_for_value(timestamp_url)
+                        primary.set_content(self._clipboard_provider_primary)
                 return True
             except Exception:
-                try:
-                    disp = Gdk.Display.get_default()
-                    if disp:
-                        disp.get_primary_clipboard().set_text(timestamp_url)
-                    return True
-                except Exception:
-                    pass
+                pass
         return False
 
     def cleanup(self):

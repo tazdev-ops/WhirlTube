@@ -235,6 +235,10 @@ class DownloadRow(Gtk.Box):
             pass
 
     def _copy_path(self, *_a) -> None:
+        """
+        Copy download path to clipboard with Wayland-safe async handling.
+        Keeps a reference to the ContentProvider to avoid GC before paste.
+        """
         try:
             p: DownloadProgress = getattr(self.task, "progress", None)
             dest: Path = getattr(self.task, "dest_dir", None)
@@ -242,19 +246,31 @@ class DownloadRow(Gtk.Box):
                 fp = Path(p.filename)
                 if not fp.is_absolute() and isinstance(dest, Path):
                     fp = dest / fp
+                
                 disp = Gdk.Display.get_default()
-                if disp:
-                    disp.get_clipboard().set_text(str(fp))
+                if not disp:
+                    return
+                clipboard = disp.get_clipboard()
+                
+                # Create a ContentProvider for text
+                # Store it as an instance variable so it doesn't get GC'd (Wayland needs this)
+                self._clipboard_provider = Gdk.ContentProvider.new_for_value(str(fp))
+                clipboard.set_content(self._clipboard_provider)
                 return
         except Exception:
             pass
         # Fallback: copy dest_dir
         try:
             disp = Gdk.Display.get_default()
-            if disp:
-                dest: Path = getattr(self.task, "dest_dir", None)
-                if isinstance(dest, Path):
-                    disp.get_clipboard().set_text(str(dest))
+            if not disp:
+                return
+            clipboard = disp.get_clipboard()
+            
+            dest: Path = getattr(self.task, "dest_dir", None)
+            if isinstance(dest, Path):
+                # Store provider to avoid GC on Wayland
+                self._clipboard_provider = Gdk.ContentProvider.new_for_value(str(dest))
+                clipboard.set_content(self._clipboard_provider)
         except Exception:
             pass
 
