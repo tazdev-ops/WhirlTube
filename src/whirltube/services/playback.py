@@ -8,6 +8,7 @@ import secrets
 import subprocess
 import threading
 from pathlib import Path
+from typing import Callable, Any
 
 from ..models import Video
 from ..mpv_embed import MpvWidget
@@ -21,8 +22,9 @@ log = logging.getLogger(__name__)
 
 
 class PlaybackService:
-    def __init__(self, mpv_widget: MpvWidget):
+    def __init__(self, mpv_widget: MpvWidget, get_setting: Callable[[str, Any], Any]):
         self.mpv_widget = mpv_widget
+        self.get_setting = get_setting
         # External MPV state
         self._proc: subprocess.Popen | None = None
         self._ipc: str | None = None
@@ -53,23 +55,34 @@ class PlaybackService:
         except Exception:
             return None
 
-    def play(
-        self, 
-        video: Video, 
-        playback_mode: str, 
-        mpv_args: str,
-        quality: str | None,
-        cookies_enabled: bool,
-        cookies_browser: str,
-        cookies_keyring: str,
-        cookies_profile: str,
-        cookies_container: str,
-        http_proxy: str | None,
-        fullscreen: bool = False,
-        sb_enabled: bool = False,
-        sb_mode: str = "mark",         # "mark" | "skip"
-        sb_categories: str = "default",
-    ) -> bool:
+    def get_cookie_spec(self) -> str | None:
+        """Get the ytdl cookie specification string from settings"""
+        if not self.get_setting("mpv_cookies_enable"):
+            return None
+        browser = (self.get_setting("mpv_cookies_browser") or "").strip()
+        if not browser:
+            return None
+        keyring = (self.get_setting("mpv_cookies_keyring") or "").strip()
+        profile = (self.get_setting("mpv_cookies_profile") or "").strip()
+        container = (self.get_setting("mpv_cookies_container") or "").strip()
+        return self._cookie_spec(browser, keyring, profile, container)
+
+    def play(self, video: Video) -> bool:
+        # Fetch settings internally
+        playback_mode = self.get_setting("playback_mode", "external")
+        mpv_args = self.get_setting("mpv_args", "") or ""
+        quality = (self.get_setting("mpv_quality") or "auto").strip()
+        cookies_enabled = self.get_setting("mpv_cookies_enable")
+        cookies_browser = self.get_setting("mpv_cookies_browser") or ""
+        cookies_keyring = self.get_setting("mpv_cookies_keyring") or ""
+        cookies_profile = self.get_setting("mpv_cookies_profile") or ""
+        cookies_container = self.get_setting("mpv_cookies_container") or ""
+        http_proxy = (self.get_setting("http_proxy") or "").strip() or None
+        fullscreen = bool(self.get_setting("mpv_fullscreen"))
+        sb_enabled = bool(self.get_setting("sb_playback_enable"))
+        sb_mode = (self.get_setting("sb_playback_mode") or "mark").strip()
+        sb_categories = (self.get_setting("sb_playback_categories") or "default").strip()
+
         # Detect Wayland/X11
         session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
         is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
@@ -83,7 +96,7 @@ class PlaybackService:
             log.debug("Native playback enabled. Attempting to resolve iOS HLS URL.")
             try:
                 # Use hardcoded hl/gl for native resolver for now
-                native_url = get_ios_hls(yt_id, hl="en", gl="US")
+                native_url = get_ios_hls(yt_id, hl="en", gl="US", proxy=http_proxy)
                 if native_url:
                     play_url = native_url
                     log.debug("Resolved native HLS URL.")

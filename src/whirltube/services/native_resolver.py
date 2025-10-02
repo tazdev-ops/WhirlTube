@@ -1,7 +1,8 @@
 from __future__ import annotations
 import httpx
+from ..util import safe_httpx_proxy
 
-def get_ios_hls(video_id: str, hl: str = "en", gl: str = "US") -> str | None:
+def get_ios_hls(video_id: str, hl: str = "en", gl: str = "US", proxy: str | None = None) -> str | None:
     headers = {
         "User-Agent": "com.google.ios.youtube/20.03.02(iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X; US)",
         "X-Goog-Api-Format-Version": "2",
@@ -27,8 +28,11 @@ def get_ios_hls(video_id: str, hl: str = "en", gl: str = "US") -> str | None:
         "racyCheckOk": True,
     }
     url = "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false"
+    
+    proxies = {"all://": safe_httpx_proxy(proxy)} if proxy else None
+    
     try:
-        with httpx.Client(timeout=8.0) as c:
+        with httpx.Client(timeout=8.0, proxies=proxies) as c:
             r = c.post(url, headers=headers, json=ctx)
             r.raise_for_status()
             js = r.json()
