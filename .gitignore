@@ -12,3 +12,4 @@ venv/
 *.bak
 # Ignore editor/backup files
 *.bak
+whirltube-git/
