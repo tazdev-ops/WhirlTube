@@ -60,22 +60,26 @@ class InnerTubeWeb(Provider):
             r = self._client.get(_SUGGEST_URL, params=params)
             r.raise_for_status()
             
-            # Response is a JSONP-like string: 'window.google.ac.h(data)'
-            # We need to strip the function call wrapper
             text = r.text
+            log.debug(f"Suggestions response: {text[:100]}...")
+            
             if text.startswith("window.google.ac.h("):
                 text = text[len("window.google.ac.h("):-1]
             
             data = json.loads(text)
             
-            # Data structure: [query, [[suggestion1, type], [suggestion2, type], ...]]
             if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
-                return [str(s[0]) for s in data[1] if isinstance(s, list) and len(s) > 0][:max_items]
+                results = [str(s[0]) for s in data[1] if isinstance(s, list) and len(s) > 0][:max_items]
+                log.debug(f"InnerTubeWeb suggestions: {results}")
+                return results
+            else:
+                log.warning(f"Unexpected data structure from suggestions API: {type(data)}")
             
         except Exception as e:
-            log.debug(f"InnerTubeWeb suggestions failed: {e}")
+            log.warning(f"InnerTubeWeb suggestions failed: {e}", exc_info=True)
             if self._fallback:
                 return self._fallback.suggestions(query, max_items)
+        
         return []
 
     def trending(self) -> list[Video]:

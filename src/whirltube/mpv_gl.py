@@ -43,8 +43,26 @@ class MpvGLWidget(Gtk.GLArea):
             log.error("GLArea error; cannot initialize")
             return
         try:
-            # Use 'gpu' vo for opengl-cb
-            self._mpv = mpv.MPV(vo='gpu', keep_open=True)
+            # Use 'gpu' vo for OpenGL callback; prefer GLES on Wayland
+            import os
+            session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+            is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
+
+            mpv_kwargs = dict(
+                vo="gpu",
+                keep_open=True,
+                idle=True,
+                profile="gpu-hq",
+                osc=True,
+                ytdl=True,
+                input_default_bindings=True,
+                config=True,
+            )
+            # On Wayland, tell mpv to use GLES (GLArea often uses EGL/GLES)
+            if is_wayland:
+                mpv_kwargs["opengl_es"] = True
+
+            self._mpv = mpv.MPV(**mpv_kwargs)
             self._gl_cb = mpv.opengl_cb.GLCallback(self._mpv)
 
             def _get_proc_address(name: str) -> int:

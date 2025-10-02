@@ -40,6 +40,22 @@ class InvidiousProvider(Provider):
         self._client: httpx.Client | None = None
         self._init_client()
         self._prefer_invidious_links = True  # return base/watch?v=ID
+        
+        # Create fallback clients once for reuse to avoid excessive client creation
+        self._fallback_client_no_verify = httpx.Client(
+            timeout=self.cfg.timeout,
+            proxy=safe_httpx_proxy(self.cfg.proxy),
+            headers={"User-Agent": UA},
+            http2=False,
+            verify=False
+        )
+        self._fallback_client_no_proxy = httpx.Client(
+            timeout=self.cfg.timeout,
+            headers={"User-Agent": UA},
+            http2=False,
+            verify=False,
+            trust_env=False
+        )
 
     def _watch_url(self, vid: str) -> str:
         if not vid:
@@ -58,6 +74,16 @@ class InvidiousProvider(Provider):
                 self._client.close()
         except Exception:
             pass
+        try:
+            if self._fallback_client_no_verify:
+                self._fallback_client_no_verify.close()
+        except Exception:
+            pass
+        try:
+            if self._fallback_client_no_proxy:
+                self._fallback_client_no_proxy.close()
+        except Exception:
+            pass
         proxy = safe_httpx_proxy(self.cfg.proxy)
         # http2 off avoids some flaky proxies; UA set to a browser for compatibility
         self._client = httpx.Client(
@@ -66,25 +92,34 @@ class InvidiousProvider(Provider):
             headers={"User-Agent": UA},
             http2=False,
         )
+        # Recreate fallback clients with updated proxy setting
+        self._fallback_client_no_verify = httpx.Client(
+            timeout=self.cfg.timeout,
+            proxy=proxy,  # Use the same proxy as main client
+            headers={"User-Agent": UA},
+            http2=False,
+            verify=False
+        )
+        self._fallback_client_no_proxy = httpx.Client(
+            timeout=self.cfg.timeout,
+            headers={"User-Agent": UA},
+            http2=False,
+            verify=False,
+            trust_env=False
+        )
 
     def _robust_api_call(self, endpoint: str, params: dict | None = None) -> dict | list:
         """Try API call with multiple fallback strategies"""
         params = params or {}
         strategies = [
             (self._client, {}),  # Normal with proxy
-            (httpx.Client(timeout=self.cfg.timeout, proxy=self.cfg.proxy, headers={"User-Agent": UA}, http2=False, verify=False), {'verify': False}),
-            (httpx.Client(timeout=self.cfg.timeout, headers={"User-Agent": UA}, http2=False, verify=False, trust_env=False), {'no_proxy': True, 'verify': False}),
+            (self._fallback_client_no_verify, {'verify': False}),  # No verify
+            (self._fallback_client_no_proxy, {'no_proxy': True, 'verify': False}),  # No proxy
         ]
         
         for client, opts in strategies:
             try:
-                # Use client directly if it's self._client, otherwise use a context manager
-                if client is self._client:
-                    r = client.get(f"{self.cfg.base}{endpoint}", params=params)
-                else:
-                    with client as c:
-                        r = c.get(f"{self.cfg.base}{endpoint}", params=params)
-                
+                r = client.get(f"{self.cfg.base}{endpoint}", params=params)
                 r.raise_for_status()
                 return r.json()
             except Exception as e:

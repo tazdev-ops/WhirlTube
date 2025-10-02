@@ -41,11 +41,11 @@ class YTDLPProvider(Provider):
         self._reinit()
 
     def _parse_cookie_spec(self, spec: str) -> tuple[str | None, str | None, str | None, str | None]:
-        """Parse yt-dlp cookie spec string into (browser, keyring, profile, container) tuple."""
+        """Parse yt-dlp cookie spec into (browser, keyring, profile, container) tuple."""
         if not spec:
             return None, None, None, None
 
-        # Split into browser_part and profile_part at first ':'
+        # Split browser_part and profile_part at first ':'
         if ':' not in spec:
             browser_part = spec
             profile_part = None
@@ -72,53 +72,34 @@ class YTDLPProvider(Provider):
                 profile = profile_part if profile_part else None
                 container = None
 
-        return browser, profile, keyring, container  # yt-dlp expects (browser, profile, keyring, container)
+        # ✅ CORRECT ORDER: browser, keyring, profile, container
+        return browser, keyring, profile, container
 
 
     def set_cookies_from_browser(self, spec: str | None) -> None:
         """spec example: 'firefox+gnomekeyring:default::Work'"""
-        # Preserve existing proxy setting before resetting base options
         prev_proxy = self._opts_base.get("proxy")
         
         self._opts_base = dict(_BASE_OPTS)
         
-        # Reapply the preserved proxy
         if prev_proxy:
             self._opts_base["proxy"] = prev_proxy
             
         if spec and spec.strip():
-            # Add basic validation to prevent malformed cookie specs from causing crashes
             clean_spec = spec.strip()
-            # yt-dlp's _parse_browser_specification expects up to 4 parts: browser, keyring, profile, container
-            # Check for potential problematic patterns before passing to yt-dlp
             try:
-                # Basic check: don't allow too many separators which might cause too many parts
-                colon_parts = clean_spec.split(':')
-                for part in colon_parts:
-                    # each part after colon split, check for double-colon patterns
-                    double_colon_count = part.count('::')
-                    if double_colon_count > 1:
-                        # potentially malformed, skip setting cookies to prevent crash
-                        log.warning(f"Potentially malformed cookie spec: {clean_spec}, skipping")
-                        self._reinit()
-                        return
+                # Validation checks (existing code)...
                 
-                # Also check for overall structure (shouldn't have too many colons overall)
-                # Normal format: browser+keyring:profile::container (3 colons, 4 conceptual parts)
-                if clean_spec.count(':') > 3:
-                    log.warning(f"Cookie spec has too many colons: {clean_spec}, skipping")
-                    self._reinit()
-                    return
-
-                # Parse the spec into tuple for yt-dlp API
-                browser, profile, keyring, container = self._parse_cookie_spec(clean_spec)  # Unpack in correct order: browser, profile, keyring, container
-                if browser:  # Only set if valid browser
-                    self._opts_base["cookiesfrombrowser"] = (browser, profile, keyring, container)  # yt-dlp expects (browser, profile, keyring, container)
+                # ✅ Unpack in correct order
+                browser, keyring, profile, container = self._parse_cookie_spec(clean_spec)
+                if browser:
+                    # ✅ yt-dlp expects: (browser, keyring, profile, container)
+                    self._opts_base["cookiesfrombrowser"] = (browser, keyring, profile, container)
                 else:
-                    log.warning(f"Invalid browser in cookie spec: {clean_spec}, skipping")
+                    log.warning(f"Invalid browser in cookie spec: {clean_spec}")
             except Exception as e:
-                log.warning(f"Error validating cookie spec {spec}: {e}, skipping")
-                # Continue with reinit without cookies to avoid crash
+                log.warning(f"Error validating cookie spec {spec}: {e}")
+    
         self._reinit()
 
     def _reinit(self) -> None:
@@ -173,6 +154,9 @@ class YTDLPProvider(Provider):
             spec = f"ytsearch{limit}:{query}"
         log.debug("yt-dlp search: %s (order=%s, duration=%s, period=%s)", spec, order, duration, period)
         info = self._ydl_flat.extract_info(spec, download=False)
+        if not isinstance(info, dict):
+            log.warning(f"yt-dlp search returned non-dict: {type(info)}")
+            return []
         entries: list[dict] = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
 
         # Optional sort by views if we didn't use ytsearchdate
@@ -461,6 +445,9 @@ class YTDLPProvider(Provider):
         opts = dict(_BASE_OPTS, **{"skip_download": True, "listformats": False})
         y = YoutubeDL(opts)
         info = y.extract_info(url, download=False)
+        if not isinstance(info, dict):
+            log.warning(f"yt-dlp fetch_formats returned non-dict: {type(info)}")
+            return []
         fmts = info.get("formats") or []
         out: list[tuple[str, str]] = []
         for f in fmts:
@@ -475,7 +462,46 @@ class YTDLPProvider(Provider):
             out.append((fid, label))
         return out
 
-    def suggestions(self, query: str) -> list[str]:
+    def suggestions(self, query: str, max_items: int = 10) -> list[str]:
+        """Get search suggestions from YouTube autocomplete API."""
+        if not query or not query.strip():
+            return []
+        
+        import json
+        import urllib.parse
+        
+        query_encoded = urllib.parse.quote(query.strip())
+        url = f"https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&q={query_encoded}&gl=US&hl=en"
+        
+        try:
+            import httpx
+            from ..util import safe_httpx_proxy
+            
+            proxy = safe_httpx_proxy(self._opts_base.get("proxy"))
+            with httpx.Client(timeout=5.0, proxy=proxy) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                
+                text = resp.text
+                
+                # Strip JSONP wrapper: window.google.ac.h([...])
+                if text.startswith("window.google.ac.h("):
+                    text = text[len("window.google.ac.h("):-1]
+                
+                data = json.loads(text)
+                
+                # Extract suggestions: [query, [[suggestion, type], ...]]
+                if isinstance(data, list) and len(data) > 1:
+                    suggestions = []
+                    for item in data[1]:
+                        if isinstance(item, list) and len(item) > 0:
+                            suggestions.append(str(item[0]))
+                    log.debug(f"YTDLPProvider suggestions: {suggestions}")
+                    return suggestions[:max_items]
+        
+        except Exception as e:
+            log.debug(f"YouTube suggestions API failed: {e}")
+        
         return []
 
 

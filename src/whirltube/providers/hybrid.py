@@ -31,9 +31,9 @@ class HybridProvider(Provider):
 
     # --- Robust Path (YTDLPProvider) ---
 
-    def search(self, query: str, limit: int, filters: dict[str, str] | None = None) -> list[Video]:
-        # YTDLPProvider handles search with filters
-        return self._robust.search(query, limit, filters)
+    def search(self, query: str, limit: int, order: str | None = None, duration: str | None = None, period: str | None = None) -> list[Video]:
+        # Forward separate filter params to YTDLPProvider
+        return self._robust.search(query, limit, order=order, duration=duration, period=period)
 
     def related(self, video_id: str) -> list[Video]:
         return self._robust.related(video_id)

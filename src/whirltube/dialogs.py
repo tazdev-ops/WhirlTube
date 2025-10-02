@@ -625,6 +625,17 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_invidious.set_text(settings.get("invidious_instance", "https://yewtu.be"))
         group_provider.add(self.entry_invidious)
 
+        # YtExtractor section (NEW)
+        group_ytextractor = Adw.PreferencesGroup(title="YtExtractor (Experimental)")
+        page_provider.add(group_ytextractor)
+
+        self.use_ytextractor = Adw.SwitchRow(
+            title="Use ytextractor for native stream resolution",
+            subtitle="Faster playback URL resolution without yt-dlp (requires: pip install ytextractor)"
+        )
+        self.use_ytextractor.set_active(bool(settings.get("use_ytextractor", False)))
+        group_ytextractor.add(self.use_ytextractor)
+
         # Invidious Account (authentication)
         group_account = Adw.PreferencesGroup(title="Invidious Account (Optional)")
         page_provider.add(group_account)
@@ -768,6 +779,8 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # Provider settings
         self.settings["use_invidious"] = bool(self.use_invidious.get_active())
         self.settings["invidious_instance"] = self.entry_invidious.get_text().strip() or "https://yewtu.be"
+        # YtExtractor settings (NEW)
+        self.settings["use_ytextractor"] = bool(self.use_ytextractor.get_active())
         # Auto-hide MPV controls
         self.settings["mpv_autohide_controls"] = bool(self.autohide_controls.get_active())
         # After completion + template

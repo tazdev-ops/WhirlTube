@@ -1,87 +1,132 @@
 # WhirlTube
 
-Wayland-first, GTK 4 + Libadwaita frontend for YouTube that:
-- Plays videos with MPV (external window by default; optional in-window embed on X11).
-- Searches and downloads with yt-dlp (no API keys).
-- Minimal dependencies; robust, async UI.
+**Wayland-first GTK4 YouTube client** with MPV playback and multi-provider backends.
 
-Status: v0.4.5
+## Status: v0.5.0 (Production-Ready)
 
-## Highlights
-- Search YouTube via yt-dlp (no API), browse Open URL (video/playlist/channel), view Related and Comments.
-- External MPV playback with quality presets (Auto/2160/1440/1080/720/480) and extra args; optional X11 embedding via python-mpv.
-- Unified downloads with robust JSON progress (main Download dialog + Quick Download).
-- Quick Download: batch URLs, Video/Audio tabs, SponsorBlock, cookies, custom yt-dlp path; per-tab output directories.
-- History: persistent search and watch history.
-- Smooth UX: loading spinners, cached settings, thumbnail placeholders on failures.
+### Highlights
+- **3 Provider Backends**:
+  - **YTDLPProvider** (default) — Heavy, battle-tested, complete
+  - **InvidiousProvider** — Privacy-focused, API-based
+  - **NewPipeProvider** (NEW) — Lightweight InnerTube, no yt-dlp dependency
+- **Playback**: External MPV (default) + optional in-window embed (X11)
+- **Downloads**: Unified queue system with resume/archive/collision handling
+- **Quick Download**: Batch URLs, Video/Audio tabs, SponsorBlock, cookies
+- **Search/Browse**: Autocomplete, trending, channels, playlists, comments
+- **Persistent State**: Watch/search history, subscriptions, download queue
+
+---
 
 ## Requirements
-System packages:
-- GTK4, Libadwaita, PyGObject (gi)
-- MPV
-- FFmpeg
-- Python 3.12+ (3.13 OK)
 
-Arch:
-  sudo pacman -S --needed gtk4 libadwaita python-gobject mpv ffmpeg
+### System (Arch)
+```bash
+sudo pacman -S --needed gtk4 libadwaita python-gobject mpv ffmpeg
+```
 
-Optional (for tiny build):
-  sudo pacman -S --needed python-httpx python-yt-dlp
+### Optional (for providers)
+```bash
+# YTDLPProvider (default)
+pip install yt-dlp
 
-If your venv cannot see system PyGObject:
-  pip install PyGObject pycairo
+# NewPipeProvider (lightweight)
+pip install quickjs  # For signature deobfuscation
+# Add your yt_extractor to PYTHONPATH or install it
 
-## Install (from source)
-- Dev deps:
-  pip install -e .[dev]
+# Embedded playback (X11 only)
+pip install python-mpv PyOpenGL
+```
 
-- Run:
-  whirltube
-  # or
-  python -m whirltube
+---
 
-- Logs:
-  WHIRLTUBE_DEBUG=1 whirltube
+## Install
 
-## Build (zipapp)
-Vendored deps:
-  bash scripts/build_and_verify.sh
+### From Source
+```bash
+git clone https://github.com/yourusername/whirltube.git
+cd whirltube
+pip install -e .[dev]
+whirltube
+```
 
-Tiny system deps:
-  bash scripts/build_zipapp_systemdeps.sh && bash scripts/deep_verify.sh
+### Debug Mode
+```bash
+WHIRLTUBE_DEBUG=1 whirltube
+tail -f ~/.cache/whirltube/whirltube.log
+```
 
-Run:
-  ./dist/whirltube
+---
 
-## Features
-- Search via yt-dlp (ytsearchN); thumbnails via httpx (thread pool, fallback placeholders).
-- Browse: Open URL (video/playlist/channel), Related videos, Comments.
-- Watch and search history with persistent storage.
-- External MPV playback (default) with custom MPV args in Preferences.
-- Optional in-window playback via python-mpv (X11 only); falls back on Wayland.
-- Preferred playback quality: Auto/2160/1440/1080/720/480 (sets MPV --ytdl-format height cap).
-- Downloads via yt-dlp:
-  - Per-item Download dialog (presets/custom format; subtitles, SponsorBlock, cookies, advanced flags).
-  - Quick Download (batch URLs; Video/Audio tabs, SponsorBlock, cookies, custom yt-dlp path).
+## Configuration
 
-## Navigation
-- Back: Escape, Backspace, Alt+Left, Ctrl+Backspace.
-- Open URL: Works for single videos, playlists, and channels (/videos tab).
+### Provider Selection
+**Preferences → Provider**:
+- **Use Invidious**: Toggle to switch from yt-dlp to Invidious
+- **Invidious Instance**: Custom instance URL (default: `https://yewtu.be`)
+- **NewPipe Mode** (TODO): Add toggle in future UI
 
-## Packaging
-AUR:
-- whirltube-git: tracks main branch tip
-- whirltube: stable releases (tags)
-See packaging/arch/ for PKGBUILD examples.
+For now, to use NewPipeProvider, edit `~/.config/whirltube/settings.json`:
+```json
+{
+  "use_newpipe": true,
+  "yt_hl": "en",
+  "yt_gl": "US"
+}
+```
 
-Flatpak: planned for v1.0.0.
+Then in `window.py`, update provider initialization:
+```python
+if bool(self.settings.get("use_newpipe")):
+    from .providers.newpipe import NewPipeProvider
+    self.provider = NewPipeProvider(
+        proxy=safe_httpx_proxy(proxy_raw) if proxy_raw else None,
+        hl=self.settings.get("yt_hl", "en"),
+        gl=self.settings.get("yt_gl", "US")
+    )
+elif bool(self.settings.get("use_invidious")):
+    # ... (existing Invidious logic)
+else:
+    # ... (existing Hybrid/YTDLP logic)
+```
 
-## Screenshots
-(TBD)
+---
 
-## Icons
-- App icon is at src/whirltube/assets/icons/hicolor/scalable/apps/whirltube.svg
-- Runtime registers icon so About/Window icons work from source and wheel.
+## Feature Matrix
+
+| Feature | YTDLPProvider | InvidiousProvider | NewPipeProvider |
+|---------|---------------|-------------------|-----------------|
+| Search + Filters | ✅ Full | ✅ Limited | ⚠️ No filters |
+| Trending | ⚠️ Flaky | ✅ Fast | ✅ Fast |
+| Autocomplete | ✅ Via InnerTube | ✅ Via API | ✅ Native |
+| Comments | ✅ Yes | ❌ No | ✅ Yes |
+| Stream Extraction | ✅ All clients | ❌ Proxied | ✅ Multi-client |
+| Signature Decipher | ✅ Built-in | N/A | ✅ QuickJS |
+| Proxy Support | ✅ Yes | ✅ Yes | ✅ Yes |
+| Cookies | ✅ Browser+File | ❌ No | ⚠️ Partial |
+| SponsorBlock | ✅ Download+Play | ❌ No | ❌ Download only |
+| External Deps | `yt-dlp` | None | `quickjs` |
+
+---
+
+## Roadmap (v0.6.0)
+
+- [ ] UI toggle for NewPipeProvider
+- [ ] Hybrid provider: NewPipe (search/browse) + yt-dlp (downloads)
+- [ ] Native stream playback (HLS without yt-dlp)
+- [ ] Flatpak packaging
+- [ ] Wayland screencasting integration
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). TL;DR:
+- Ruff + mypy + pytest
+- Conventional commits
+- Max ~300 lines/PR
+
+---
 
 ## License
-GPL-3.0-or-later. See LICENSE.
+
+GPL-3.0-or-later

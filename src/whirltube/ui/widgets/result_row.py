@@ -295,7 +295,14 @@ class ResultRow(Gtk.Box):
     def _load_thumb(self) -> None:
         with timed(f"Thumbnail load: {self.video.title[:30]}"):
             # Check cancellation early
-            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+            if not hasattr(self, '_thumb_future') or self._thumb_future is None:
+                return
+            
+            # Also check if already done (cancelled or completed)
+            try:
+                if self._thumb_future.done():
+                    return
+            except Exception:
                 return
             
             # Check cache first
@@ -304,8 +311,14 @@ class ResultRow(Gtk.Box):
                 try:
                     data = cached_path.read_bytes()
                     # Check cancellation before updating UI
-                    if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                    if not hasattr(self, '_thumb_future') or self._thumb_future is None:
                         return
+                    try:
+                        if self._thumb_future.done():
+                            return
+                    except Exception:
+                        return
+                    
                     GLib.idle_add(self._set_thumb, data)
                     return
                 except Exception as e:
@@ -335,13 +348,23 @@ class ResultRow(Gtk.Box):
             
             if data is None:
                 # Check cancellation before updating UI
-                if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                if not hasattr(self, '_thumb_future') or self._thumb_future is None:
+                    return
+                try:
+                    if self._thumb_future.done():
+                        return
+                except Exception:
                     return
                 GLib.idle_add(self._set_thumb_placeholder)
                 return
             
             # Check cancellation before caching
-            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+            if not hasattr(self, '_thumb_future') or self._thumb_future is None:
+                return
+            try:
+                if self._thumb_future.done():
+                    return
+            except Exception:
                 return
             
             # Cache the downloaded thumbnail
@@ -351,7 +374,12 @@ class ResultRow(Gtk.Box):
                 log.debug(f"Failed to cache thumbnail: {e}")
             
             # Check cancellation before updating UI
-            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+            if not hasattr(self, '_thumb_future') or self._thumb_future is None:
+                return
+            try:
+                if self._thumb_future.done():
+                    return
+            except Exception:
                 return
             GLib.idle_add(self._set_thumb, data)
 

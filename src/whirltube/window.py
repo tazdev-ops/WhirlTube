@@ -13,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Adw, Gio, GLib, Gtk, Gdk
+from gi.repository import Adw, Gio, GLib, Gtk, Gdk, Pango
 
 from . import __version__
 from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
@@ -102,12 +102,24 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("win_h", 740)
         self.settings.setdefault("yt_hl", "en")
         self.settings.setdefault("yt_gl", "US")
+        self.settings.setdefault("use_ytextractor", False)  # NEW
         
         # Initialize provider with global proxy and optional Invidious
         proxy_raw = (self.settings.get("http_proxy") or "").strip()
         proxy = safe_httpx_proxy(proxy_raw) if proxy_raw else None
 
-        if bool(self.settings.get("use_invidious")):
+        # Check for ytextractor provider
+        if bool(self.settings.get("use_ytextractor")):
+            try:
+                from .providers.ytextractor_provider import YtExtractorProvider
+                hl = (self.settings.get("yt_hl") or "en").strip() or "en"
+                gl = (self.settings.get("yt_gl") or "US").strip() or "US"
+                self.provider = YtExtractorProvider(proxy=proxy, hl=hl, gl=gl)
+                log.info("Using YtExtractor provider (native stream resolution)")
+            except Exception as e:
+                log.warning(f"Failed to initialize YtExtractor provider: {e}, falling back to yt-dlp")
+                self.provider = YTDLPProvider(proxy)
+        elif bool(self.settings.get("use_invidious")):
             base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
             self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy))
         else:
@@ -121,6 +133,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_generation = 0
         self._search_lock = threading.Lock()
         self._thumb_loader_pool = ThreadPoolExecutor(max_workers=MAX_THUMB_WORKERS)
+        
+        # Create cached suggestion client to avoid creating new instances per keystroke
+        self._suggestion_client = None
         
         # ToolbarView
         self.toolbar_view = Adw.ToolbarView()
@@ -391,18 +406,35 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_suggestions_popover.set_parent(self.search)
         self._search_suggestions_popover.set_autohide(True)
         
+        # Container for proper sizing
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        container.set_spacing(0)
+        
         # Scrolled window for suggestions
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_max_content_height(300)
+        scroll.set_min_content_height(50)
+        
+        # Set initial size (will be updated dynamically)
+        scroll.set_size_request(400, 100)
+        
+        # Enable natural size propagation
+        scroll.set_propagate_natural_height(True)
+        scroll.set_propagate_natural_width(True)
         
         # List box for suggestions
         self._suggestions_list = Gtk.ListBox()
         self._suggestions_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self._suggestions_list.add_css_class("navigation-sidebar")
-        scroll.set_child(self._suggestions_list)
         
-        self._search_suggestions_popover.set_child(scroll)
+        scroll.set_child(self._suggestions_list)
+        container.append(scroll)
+        
+        self._search_suggestions_popover.set_child(container)
+        
+        # Store reference to scroll for dynamic sizing
+        self._suggestions_scroll = scroll
         
         # Connect row activation
         self._suggestions_list.connect("row-activated", self._on_suggestion_selected)
@@ -419,39 +451,44 @@ class MainWindow(Adw.ApplicationWindow):
         # Local suggestions (existing)
         local = search_history_suggestions(text, limit=5)
 
-        # Remote suggestions (YouTube suggestqueries), merge/dedupe
+        # Remote suggestions - use configured provider
         def worker():
             remote = []
             try:
-                from .providers.innertube_web import InnerTubeWeb
-                web = InnerTubeWeb(hl=(self.settings.get("yt_hl") or "en"),
-                                   gl=(self.settings.get("yt_gl") or "US"))
-                remote = web.suggestions(text, max_items=10)
-            except Exception:
+                # Use self.provider instead of creating new client
+                remote = self.provider.suggestions(text, max_items=10)
+                log.debug(f"Got {len(remote)} remote suggestions for '{text}'")
+            except Exception as e:
+                log.warning(f"Remote suggestions failed: {e}")
                 remote = []
+            
             # merge + dedupe
             merged, seen = [], set()
             for s in local + remote:
                 if s and s.lower() not in seen:
                     seen.add(s.lower())
                     merged.append(s)
+            
+            log.debug(f"Total suggestions: {len(merged)}")
             GLib.idle_add(self._populate_suggestions_list, merged[:10])
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
     def _populate_suggestions_list(self, items: list[str]) -> bool:
-        # clear list and repopulate
+        # Clear list and repopulate
         if not items:
             self._search_suggestions_popover.popdown()
             return False
+        
         # Remove old rows
         while True:
             row = self._suggestions_list.get_row_at_index(0)
             if not row:
                 break
             self._suggestions_list.remove(row)
-        # Add rows
+        
+        # Add rows with proper sizing
         for s in items:
             row = Gtk.ListBoxRow()
             label = Gtk.Label(label=s, xalign=0)
@@ -459,14 +496,30 @@ class MainWindow(Adw.ApplicationWindow):
             label.set_margin_bottom(8)
             label.set_margin_start(12)
             label.set_margin_end(12)
+            label.set_wrap(False)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_max_width_chars(50)  # Prevent extremely wide suggestions
             row.set_child(label)
-            row._suggestion_text = s  # keep for handler
+            row._suggestion_text = s
             self._suggestions_list.append(row)
         
+        # Update size to match search entry width
+        try:
+            search_width = self.search.get_allocated_width()
+            if search_width > 100:  # Valid width
+                self._suggestions_scroll.set_size_request(search_width, -1)
+            else:
+                # Fallback to reasonable default
+                self._suggestions_scroll.set_size_request(400, -1)
+        except Exception:
+            # If sizing fails, use default
+            self._suggestions_scroll.set_size_request(400, -1)
+    
         if items:
             self._search_suggestions_popover.popup()
         else:
             self._search_suggestions_popover.popdown()
+        
         return False
 
     def _on_suggestion_selected(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
@@ -928,13 +981,23 @@ class MainWindow(Adw.ApplicationWindow):
             if new_dir:
                 self.download_dir = Path(new_dir)
                 self.download_manager.set_download_dir(self.download_dir)
-            # Reconfigure provider: Invidious vs yt-dlp
+            # Reconfigure provider: ytextractor -> Invidious -> yt-dlp
             proxy_raw = (self.settings.get("http_proxy") or "").strip()
             proxy = safe_httpx_proxy(proxy_raw) if proxy_raw else None
+            use_ytex = bool(self.settings.get("use_ytextractor"))
             use_invid = bool(self.settings.get("use_invidious"))
             invid_base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
             try:
-                if use_invid:
+                if use_ytex:
+                    try:
+                        from .providers.ytextractor_provider import YtExtractorProvider
+                        hl = (self.settings.get("yt_hl") or "en").strip() or "en"
+                        gl = (self.settings.get("yt_gl") or "US").strip() or "US"
+                        self.provider = YtExtractorProvider(proxy=proxy, hl=hl, gl=gl)
+                    except Exception:
+                        log.warning("YtExtractor provider disabled or not available, falling back to yt-dlp")
+                        self.provider = YTDLPProvider(proxy)
+                elif use_invid:
                     self.provider = InvidiousProvider(invid_base, proxy=proxy, fallback=YTDLPProvider(proxy))
                 else:
                     self.provider = YTDLPProvider(proxy)
@@ -945,6 +1008,9 @@ class MainWindow(Adw.ApplicationWindow):
                         self.provider.set_cookies_from_browser(spec)
                     elif isinstance(self.provider, InvidiousProvider):
                         # Set cookies on the fallback YTDLPProvider for InvidiousProvider
+                        self.provider._fallback.set_cookies_from_browser(spec)
+                    elif isinstance(self.provider, YtExtractorProvider):
+                        # Set cookies on the fallback YTDLPProvider for YtExtractorProvider
                         self.provider._fallback.set_cookies_from_browser(spec)
             except Exception:
                 # fallback to yt-dlp
@@ -981,6 +1047,15 @@ class MainWindow(Adw.ApplicationWindow):
             self.download_manager.persist_queue()
         except Exception:
             pass
+            
+        # Close global HTTP client to prevent resource leak
+        try:
+            from .ui.widgets.result_row import _http_client
+            if _http_client and not _http_client.is_closed:
+                _http_client.close()
+        except Exception:
+            pass
+            
         save_settings(self.settings)
         return False
 
@@ -1187,11 +1262,15 @@ class MainWindow(Adw.ApplicationWindow):
         search.on_search_activate(entry, self._run_search)
 
     def _run_search(self, query: str) -> None:
+        # Increment search generation atomically with lock to prevent race conditions
+        with self._search_lock:
+            self._search_generation += 1
+            current_gen = self._search_generation
         search.run_search(
             query=query,
             provider=self.provider,
             settings=self.settings,
-            search_generation=self._search_generation,
+            search_generation=current_gen,
             show_loading_func=self._show_loading,
             show_error_func=self._show_error,
             populate_results_func=self._populate_results,

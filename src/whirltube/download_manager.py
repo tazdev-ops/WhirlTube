@@ -318,6 +318,8 @@ class DownloadManager:
         self._rows: list[DownloadRow] = []
         # persistent queue path
         self._queue_path: Path = _QUEUE_FILE
+        # Thread lock for thread-safe queue and active count operations
+        self._lock = threading.Lock()
 
     def set_download_dir(self, path: Path) -> None:
         self.download_dir = path
@@ -353,26 +355,31 @@ class DownloadManager:
         self._rows.append(row)
         self.show_downloads_view()
         # Enqueue and attempt to start
-        self._queue.append((video, opts, dest_dir, row))
+        with self._lock:
+            self._queue.append((video, opts, dest_dir, row))
         self._persist_queue()
         self._maybe_start_next()
 
     def _maybe_start_next(self) -> None:
-        # Start as many as allowed
+        started_any = False
         while self._active < self._max_concurrent and self._queue:
             video, opts, dest_dir, row = self._queue.pop(0)
-            # Persist immediately after queue modification, before task start
-            self._persist_queue()
+            started_any = True
             try:
                 self._start_task(video, opts, dest_dir, row)
             except Exception as e:
-                # If task fails to start, decrement active count
                 self._active = max(0, self._active - 1)
-                # Mark row as error
                 try:
-                    row.update_progress(DownloadProgress(status="error", error=f"Failed to start: {e}"))
+                    row.update_progress(DownloadProgress(
+                        status="error", 
+                        error=f"Failed to start: {e}"
+                    ))
                 except Exception:
                     pass
+        
+        # ✅ Persist once after all starts
+        if started_any:
+            self._persist_queue()
 
     def _cancel_row(self, row: DownloadRow | None) -> None:
         # If None passed (shouldn't happen), ignore
@@ -380,18 +387,20 @@ class DownloadManager:
             return
         # If queued: remove from queue
         removed = False
-        for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
-            if r is row:
-                try:
-                    self._queue.pop(i)
-                    removed = True
-                except Exception:
-                    pass
-                # Persist after successful removal
-                if removed:
-                    self._persist_queue()
-                row.mark_cancelled()
-                return
+        with self._lock:
+            for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
+                if r is row:
+                    try:
+                        self._queue.pop(i)
+                        removed = True
+                    except Exception:
+                        pass
+                    break
+        # Persist after successful removal
+        if removed:
+            self._persist_queue()
+        row.mark_cancelled()
+        return
         # If running: try to stop the task
         task = getattr(row, "task", None)
         if task is None:
@@ -416,20 +425,22 @@ class DownloadManager:
             return
         # Re-enqueue fresh
         row.set_queued()
-        self._queue.append((v, o, d, row))
+        with self._lock:
+            self._queue.append((v, o, d, row))
         self._maybe_start_next()
 
     def _remove_row(self, row: DownloadRow | None) -> None:
         if row is None:
             return
         # If queued, remove from queue first
-        for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
-            if r is row:
-                try:
-                    self._queue.pop(i)
-                except Exception:
-                    pass
-                break
+        with self._lock:
+            for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
+                if r is row:
+                    try:
+                        self._queue.pop(i)
+                    except Exception:
+                        pass
+                    break
         # If running, attempt cancel
         if row.state() == "downloading":
             self._cancel_row(row)
@@ -540,7 +551,8 @@ class DownloadManager:
                             self.show_toast(f"Download failed: {video.title}")
                             _notify(f"Download failed: {video.title}")
                     finally:
-                        self._active = max(0, self._active - 1)
+                        with self._lock:
+                            self._active = max(0, self._active - 1)
                         self._maybe_start_next()
                     return False
                 GLib.idle_add(_done)
