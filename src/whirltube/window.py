@@ -2,42 +2,63 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
-import shlex
-import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import re
 
-import httpx
 
 from . import __version__
-from .app import APP_ID
 from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
 from .history import add_search_term, add_watch, list_watch
 from .models import Video
 from .mpv_embed import MpvWidget
-from .mpv_gl import MpvGLWidget
+
+# Use GL-based widget for Wayland compatibility if available
+# Prefer GL widget on Wayland, fallback to X11 widget on X11
+try:
+    from .mpv_gl import MpvGLWidget
+    HAS_GL_WIDGET = True
+except ImportError:
+    HAS_GL_WIDGET = False
+    MpvGLWidget = None  # type: ignore
+
+# Detect session type for better widget selection
+SESSION_TYPE = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
+IS_WAYLAND = SESSION_TYPE == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 from .providers.ytdlp import YTDLPProvider
 from .providers.invidious import InvidiousProvider
 from .download_manager import DownloadManager
-from .search_filters import normalize_search_filters
 from .navigation_controller import NavigationController
 from .download_history import list_downloads
 from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
+from .watch_later import (
+    list_watch_later,
+    clear_watch_later,
+    get_watch_later_count,
+)
+from .thumbnail_cache import (
+    clear_cache as clear_thumbnail_cache,
+    get_cache_stats,
+    cleanup_old_cache,
+    enforce_cache_size_limit,
+)
+from .history import (
+    search_history_suggestions,
+    clear_search_history,
+    get_search_history_count,
+)
 from .quickdownload import QuickDownloadWindow
 from .ui.widgets.result_row import ResultRow
 from .ui.widgets.mpv_controls import MpvControls
 from .services.playback import PlaybackService
 from .ui.controllers import search
 from .metrics import timed
-from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy, is_valid_youtube_url
+from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
 
 import gi
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
+from gi.repository import Adw, Gio, GLib, Gtk
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -73,6 +94,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("playback_mode", "external")  # external | embedded
         self.settings.setdefault("mpv_args", "")
         self.settings.setdefault("mpv_quality", "auto")
+        self.settings.setdefault("native_playback", False)
 
         # Optional playback cookies for MPV
         self.settings.setdefault("mpv_cookies_enable", False)
@@ -85,6 +107,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("mpv_autohide_controls", False)
         self.settings.setdefault("download_template", "%(title)s.%(ext)s")
         self.settings.setdefault("download_auto_open_folder", False)
+        self.settings.setdefault("quick_quality_presets", "1080p,720p,audio")  # NEW
         # SponsorBlock settings
         self.settings.setdefault("sb_playback_enable", False)
         self.settings.setdefault("sb_playback_mode", "mark")  # mark | skip
@@ -92,24 +115,37 @@ class MainWindow(Adw.ApplicationWindow):
         # Window size persistence
         self.settings.setdefault("win_w", 1080)
         self.settings.setdefault("win_h", 740)
+        self.settings.setdefault("yt_hl", "en")
+        self.settings.setdefault("yt_gl", "US")
         
         # Initialize provider with global proxy and optional Invidious
-        proxy = (self.settings.get("http_proxy") or "").strip() or None
+        proxy_raw = (self.settings.get("http_proxy") or "").strip()
+        proxy = safe_httpx_proxy(proxy_raw) if proxy_raw else None
+
         if bool(self.settings.get("use_invidious")):
             base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
-            self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+            self.provider = InvidiousProvider(base, proxy=proxy, fallback=YTDLPProvider(proxy))
         else:
-            self.provider = YTDLPProvider(proxy or None)
+            fb = YTDLPProvider(proxy)
+            from .providers.innertube_web import InnerTubeWeb
+            from .providers.hybrid import HybridProvider
+            hl = (self.settings.get("yt_hl") or "en").strip() or "en"
+            gl = (self.settings.get("yt_gl") or "US").strip() or "US"
+            self.provider = HybridProvider(InnerTubeWeb(hl=hl, gl=gl), fb)
         
         # Pass cookies to provider as well (helps trending/region walls)
         try:
-            if isinstance(self.provider, YTDLPProvider):
-                spec = self._cookies_spec_for_ytdlp()
-                if spec:
+            spec = self._cookies_spec_for_ytdlp()
+            if spec:
+                if isinstance(self.provider, YTDLPProvider):
                     self.provider.set_cookies_from_browser(spec)
+                elif isinstance(self.provider, InvidiousProvider):
+                    # Set cookies on the fallback YTDLPProvider for InvidiousProvider
+                    self.provider._fallback.set_cookies_from_browser(spec)
         except Exception:
             pass
         self._search_generation = 0
+        self._search_lock = threading.Lock()
         self._thumb_loader_pool = ThreadPoolExecutor(max_workers=MAX_THUMB_WORKERS)
         
         # ToolbarView
@@ -120,9 +156,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.toolbar_view.add_top_bar(header)
         
         # Initialize MPV controls widget and service
-        # Use GL-based widget for Wayland compatibility
-        self.mpv_widget = MpvGLWidget()
+        # Use GL-based widget for Wayland compatibility if available
+        # On Wayland, prefer GL widget; on X11, prefer X11 widget
+        if IS_WAYLAND and HAS_GL_WIDGET:
+            self.mpv_widget = MpvGLWidget()
+        elif HAS_GL_WIDGET:
+            # Use GL widget as fallback if available (better compatibility)
+            self.mpv_widget = MpvGLWidget()
+        else:
+            # Fallback to X11 widget
+            self.mpv_widget = MpvWidget()
         self.playback_service = PlaybackService(self.mpv_widget)
+        self.playback_service.native_playback_enabled = bool(self.settings.get("native_playback"))
         self.mpv_controls = MpvControls(self.playback_service)
         
         # Add the MPV control bar as a top bar
@@ -146,6 +191,10 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Import Subscriptions…", "win.subs_import")
         menu.append("Export Subscriptions…", "win.subs_export")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
+        menu.append("Watch Later", "win.watch_later")
+        menu.append("Clear Watch Later", "win.clear_watch_later")
+        menu.append("Clear Search History", "win.clear_search_history")
+        menu.append("Clear Thumbnail Cache", "win.clear_thumb_cache")
         menu.append("Download History", "win.download_history")
         menu.append("Cancel All Downloads", "win.cancel_all_downloads")
         menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
@@ -157,52 +206,60 @@ class MainWindow(Adw.ApplicationWindow):
         menu_btn.set_menu_model(menu)
         header.pack_start(menu_btn)
         
-        # Quick actions (left)
-        self.btn_open = Gtk.Button(label="Open URL…")
-        self.btn_open.set_can_focus(True)
-        self.btn_open.set_tooltip_text("Open any YouTube URL (video/playlist/channel)")
-        self.btn_open.connect("clicked", self._on_open_url)
-        header.pack_start(self.btn_open)
-        
-        self.btn_hist = Gtk.Button(label="History")
-        self.btn_hist.set_can_focus(True)
-        self.btn_hist.set_tooltip_text("Watch history")
-        self.btn_hist.connect("clicked", self._on_history)
-        header.pack_start(self.btn_hist)
-        
-        self.btn_feed = Gtk.Button(label="Feed")
-        self.btn_feed.set_can_focus(True)
-        self.btn_feed.set_tooltip_text("Recent from followed channels")
-        self.btn_feed.connect("clicked", self._on_feed)
-        header.pack_start(self.btn_feed)
-        
-        self.btn_trending = Gtk.Button(label="Trending")
-        self.btn_trending.set_can_focus(True)
-        self.btn_trending.set_tooltip_text("YouTube trending now")
-        self.btn_trending.connect("clicked", self._on_trending)
-        header.pack_start(self.btn_trending)
-        
-        self.btn_qdl = Gtk.Button(label="Quick Download")
-        self.btn_qdl.set_can_focus(True)
-        self.btn_qdl.set_tooltip_text("Batch download multiple URLs")
-        self.btn_qdl.connect("clicked", self._on_quick_download)
-        header.pack_start(self.btn_qdl)
-        
-        # Search
+        # Create primary actions menu (left side)
+        primary_menu = Gio.Menu()
+        primary_menu.append("Open URL…", "win.open_url")
+        primary_menu.append("Quick Download", "win.quick_download")
+        primary_menu.append("Watch Later", "win.watch_later")
+
+        # Sections submenu
+        sections_menu = Gio.Menu()
+        sections_menu.append("History", "win.history")
+        sections_menu.append("Feed", "win.feed")
+        sections_menu.append("Trending", "win.trending")
+        print("Menu item added for trending with action 'win.trending'")
+        primary_menu.append_section("Browse", sections_menu)
+
+        primary_btn = Gtk.MenuButton(icon_name="folder-open-symbolic")
+        primary_btn.set_menu_model(primary_menu)
+        primary_btn.set_tooltip_text("Browse")
+        header.pack_start(primary_btn)
+
+        # NEW: Watch Later button with count badge (keep this minimal one to show importance)
+        self.btn_watch_later = Gtk.Button(icon_name="bookmark-new-symbolic")  # Use icon instead
+        self._update_watch_later_button()
+        self.btn_watch_later.set_can_focus(True)
+        self.btn_watch_later.set_tooltip_text("Videos saved for later")
+        self.btn_watch_later.connect("clicked", self._on_watch_later)
+        header.pack_start(self.btn_watch_later)
+
+        # Search with autocomplete
         self.search = Gtk.SearchEntry(hexpand=True)
         self.search.set_can_focus(True)
         self.search.set_placeholder_text("Search YouTube…")
         header.set_title_widget(self.search)
         self.search.connect("activate", self._on_search_activate)
+        print("Connected 'activate' for search entry:", self.search)
+        self.search.connect("search-changed", self._on_search_changed)
+        print("Connected 'search-changed' for search entry:", self.search)
+
         # Clear text when the user presses Escape or the clear icon
         def _stop_search(_entry, *_a):
             try:
                 self.search.set_text("")
                 self._set_welcome()
+                # Hide suggestions when clearing
+                if hasattr(self, '_search_suggestions_popover'):
+                    self._search_suggestions_popover.popdown()
             except Exception:
+                import logging
+                logging.getLogger("search.debug").exception("Error in _stop_search")
                 pass
         self.search.connect("stop-search", _stop_search)
-        
+
+        # Create suggestions popover
+        self._create_search_suggestions()
+
         # Filters popover
         self.btn_filters = Gtk.MenuButton(icon_name="view-list-symbolic")
         self.btn_filters.set_can_focus(True)
@@ -307,6 +364,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.download_manager.restore_queued()
 
         self._create_actions()
+        
+        # Debug: Print all window and app actions
+        print("Window actions:", list(self.list_actions()))
+        app_obj = self.get_application()
+        if app_obj:
+            print("App actions:", list(app_obj.list_actions()))
+        
         self._set_welcome()
         self._install_shortcuts()
 
@@ -327,8 +391,126 @@ class MainWindow(Adw.ApplicationWindow):
         self._mpv_current_url: str | None = None
         self._last_filters: dict[str, str] | None = None
 
+    def _update_watch_later_button(self) -> None:
+        """Update Watch Later button label with count badge"""
+        count = get_watch_later_count()
+        if count > 0:
+            self.btn_watch_later.set_label(f"Watch Later ({count})")
+        else:
+            self.btn_watch_later.set_label("Watch Later")
+
+    def _create_search_suggestions(self) -> None:
+        """Create search suggestions popover"""
+        self._search_suggestions_popover = Gtk.Popover()
+        self._search_suggestions_popover.set_parent(self.search)
+        self._search_suggestions_popover.set_autohide(True)
+        
+        # Scrolled window for suggestions
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(300)
+        
+        # List box for suggestions
+        self._suggestions_list = Gtk.ListBox()
+        self._suggestions_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._suggestions_list.add_css_class("navigation-sidebar")
+        scroll.set_child(self._suggestions_list)
+        
+        self._search_suggestions_popover.set_child(scroll)
+        
+        # Connect row activation
+        self._suggestions_list.connect("row-activated", self._on_suggestion_selected)
+
+    def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
+        """Handle search text changes for autocomplete"""
+        text = entry.get_text().strip()
+        
+        # Only show suggestions if text is not empty and not just activated
+        if not text:
+            self._search_suggestions_popover.popdown()
+            return
+
+        # Local suggestions (existing)
+        local = search_history_suggestions(text, limit=5)
+
+        # Remote suggestions (YouTube suggestqueries), merge/dedupe
+        def worker():
+            remote = []
+            try:
+                from .providers.innertube_web import InnerTubeWeb
+                web = InnerTubeWeb(hl=(self.settings.get("yt_hl") or "en"),
+                                   gl=(self.settings.get("yt_gl") or "US"))
+                remote = web.suggestions(text, max_items=10)
+            except Exception:
+                remote = []
+            # merge + dedupe
+            merged, seen = [], set()
+            for s in local + remote:
+                if s and s.lower() not in seen:
+                    seen.add(s.lower())
+                    merged.append(s)
+            GLib.idle_add(self._populate_suggestions_list, merged[:10])
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _populate_suggestions_list(self, items: list[str]) -> bool:
+        # clear list and repopulate
+        if not items:
+            self._search_suggestions_popover.popdown()
+            return False
+        # Remove old rows
+        while True:
+            row = self._suggestions_list.get_row_at_index(0)
+            if not row:
+                break
+            self._suggestions_list.remove(row)
+        # Add rows
+        for s in items:
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=s, xalign=0)
+            label.set_margin_top(8)
+            label.set_margin_bottom(8)
+            label.set_margin_start(12)
+            label.set_margin_end(12)
+            row.set_child(label)
+            row._suggestion_text = s  # keep for handler
+            self._suggestions_list.append(row)
+        
+        if items:
+            self._search_suggestions_popover.popup()
+        else:
+            self._search_suggestions_popover.popdown()
+        return False
+
+    def _on_suggestion_selected(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        """Handle suggestion selection"""
+        if not hasattr(row, '_suggestion_text'):
+            return
+        
+        suggestion = row._suggestion_text
+        self.search.set_text(suggestion)
+        self._search_suggestions_popover.popdown()
+        
+        # Trigger search
+        add_search_term(suggestion)
+        self._run_search(suggestion)
+
         # Save settings on window close
         self.connect("close-request", self._on_main_close)
+
+        # Clean up old thumbnails on startup (runs in background)
+        def _cleanup_cache():
+            import threading
+            def worker():
+                try:
+                    cleanup_old_cache()
+                    enforce_cache_size_limit()
+                except Exception as e:
+                    log.debug(f"Cache cleanup failed: {e}")
+            threading.Thread(target=worker, daemon=True).start()
+
+        GLib.idle_add(_cleanup_cache)
         
 
         
@@ -338,7 +520,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.add_action(focus_search)
         app = self.get_application()
         if app:
-            app.set_accels_for_action("win.focus_search", ["<Primary>F"])
+            app.set_accels_for_action("win.focus_search", ["<Primary>f", "<Primary>F"])
+
+        # NEW: Add spacebar toggle play action
+        toggle_play = Gio.SimpleAction.new("toggle_play", None)
+        toggle_play.connect("activate", lambda *_: self.playback_service.cycle_pause() if self.playback_service.is_running() else None)
+        self.add_action(toggle_play)
+        if app:
+            app.set_accels_for_action("win.toggle_play", ["space"])
 
     def _on_mpv_started(self, mode: str):
         """Called when MPV playback starts"""
@@ -383,7 +572,25 @@ class MainWindow(Adw.ApplicationWindow):
     def _install_key_controller(self) -> None:
         ctrl = Gtk.EventControllerKey()
         def on_key(_c, keyval, keycode, state):
+            # Handle search suggestions navigation
+            if self.search.has_focus() and hasattr(self, '_search_suggestions_popover'):
+                if self._search_suggestions_popover.get_visible():
+                    from gi.repository import Gdk
+                    k = Gdk.keyval_name(keyval)
+                    
+                    if k == "Down":
+                        # Focus first suggestion
+                        first_row = self._suggestions_list.get_row_at_index(0)
+                        if first_row:
+                            self._suggestions_list.select_row(first_row)
+                        return True
+                    elif k == "Escape":
+                        self._search_suggestions_popover.popdown()
+                        return True
+            
+            # Existing MPV controls
             return self.mpv_controls.handle_key_press(keyval, keycode, state)
+        
         ctrl.connect("key-pressed", on_key)
         self.add_controller(ctrl)
 
@@ -391,22 +598,67 @@ class MainWindow(Adw.ApplicationWindow):
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
+        print("Added action: about")
 
         prefs = Gio.SimpleAction.new("preferences", None)
         prefs.connect("activate", self._on_preferences)
         self.add_action(prefs)
+        print("Added action: preferences")
 
         # Add the open URL action for Ctrl+L
         open_url = Gio.SimpleAction.new("open_url", None)
         open_url.connect("activate", self._on_open_url)
         self.add_action(open_url)
+        print("Added action: open_url")
         app = self.get_application()
         if app:
             app.set_accels_for_action("win.open_url", ["<Primary>L"])
+            print("Set accelerator for win.open_url: Ctrl+L")
 
         shortcuts = Gio.SimpleAction.new("shortcuts", None)
         shortcuts.connect("activate", self._on_shortcuts)
         self.add_action(shortcuts)
+        print("Added action: shortcuts")
+
+        # Browse actions
+        history_action = Gio.SimpleAction.new("history", None)
+        history_action.connect("activate", self._on_history)
+        self.add_action(history_action)
+        print("Added action: history")
+
+        feed_action = Gio.SimpleAction.new("feed", None)
+        feed_action.connect("activate", self._on_feed)
+        self.add_action(feed_action)
+        print("Added action: feed")
+
+        trending_action = Gio.SimpleAction.new("trending", None)
+        trending_action.connect("activate", self._on_trending)
+        self.add_action(trending_action)
+        print("Added action: trending")
+
+        # Quick Download action
+        quick_download_action = Gio.SimpleAction.new("quick_download", None)
+        quick_download_action.connect("activate", self._on_quick_download)
+        self.add_action(quick_download_action)
+
+        # Watch Later actions
+        watch_later_action = Gio.SimpleAction.new("watch_later", None)
+        watch_later_action.connect("activate", self._on_watch_later)
+        self.add_action(watch_later_action)
+
+        clear_wl_action = Gio.SimpleAction.new("clear_watch_later", None)
+        clear_wl_action.connect("activate", self._on_clear_watch_later)
+        self.add_action(clear_wl_action)
+
+        # Search history action
+        clear_search_action = Gio.SimpleAction.new("clear_search_history", None)
+        clear_search_action.connect("activate", self._on_clear_search_history)
+        self.add_action(clear_search_action)
+
+        # Thumbnail cache action
+        clear_cache_action = Gio.SimpleAction.new("clear_thumb_cache", None)
+        clear_cache_action.connect("activate", self._on_clear_thumbnail_cache)
+        self.add_action(clear_cache_action)
 
         dlh = Gio.SimpleAction.new("download_history", None)
         dlh.connect("activate", self._on_download_history)
@@ -593,6 +845,93 @@ class MainWindow(Adw.ApplicationWindow):
                 self._show_error(f"Export failed: {e}")
         dlg.save(self, None, on_done, None)
 
+    def _on_clear_watch_later(self, *_a) -> None:
+        """Clear all videos from watch later after confirmation"""
+        count = get_watch_later_count()
+        if count == 0:
+            self._show_toast("Watch Later is already empty")
+            return
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Clear Watch Later?",
+            body=f"Remove all {count} video(s) from Watch Later?",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Clear")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        
+        def on_response(d, response):
+            if response == "clear":
+                cleared = clear_watch_later()
+                self._show_toast(f"Cleared {cleared} video(s) from Watch Later")
+                self._update_watch_later_button()
+                # Refresh view if currently showing watch later
+                if self.stack.get_visible_child_name() == "results":
+                    current_results = len([c for c in self.results_box])
+                    # Simple heuristic: if results match cleared count, we're probably showing watch later
+                    if current_results > 0:
+                        self._on_watch_later()
+        
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _on_clear_search_history(self, *_a) -> None:
+        """Clear search history after confirmation"""
+        count = get_search_history_count()
+        
+        if count == 0:
+            self._show_toast("Search history is already empty")
+            return
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Clear Search History?",
+            body=f"Remove all {count} search history entries?",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Clear")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        
+        def on_response(d, response):
+            if response == "clear":
+                cleared = clear_search_history()
+                self._show_toast(f"Cleared {cleared} search history entries")
+        
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _on_clear_thumbnail_cache(self, *_a) -> None:
+        """Clear thumbnail cache after showing stats"""
+        stats = get_cache_stats()
+        
+        if stats['file_count'] == 0:
+            self._show_toast("Thumbnail cache is already empty")
+            return
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Clear Thumbnail Cache?",
+            body=f"Remove {stats['file_count']} cached thumbnails ({stats['total_size_mb']} MB)?",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Clear")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        
+        def on_response(d, response):
+            if response == "clear":
+                count = clear_thumbnail_cache()
+                self._show_toast(f"Cleared {count} cached thumbnails")
+        
+        dialog.connect("response", on_response)
+        dialog.present()
+
     def _on_preferences(self, *_a) -> None:
         win = PreferencesWindow(self, self.settings)
         win.present()
@@ -604,22 +943,26 @@ class MainWindow(Adw.ApplicationWindow):
                 self.download_dir = Path(new_dir)
                 self.download_manager.set_download_dir(self.download_dir)
             # Reconfigure provider: Invidious vs yt-dlp
-            proxy = (self.settings.get("http_proxy") or "").strip() or None
+            proxy_raw = (self.settings.get("http_proxy") or "").strip()
+            proxy = safe_httpx_proxy(proxy_raw) if proxy_raw else None
             use_invid = bool(self.settings.get("use_invidious"))
             invid_base = (self.settings.get("invidious_instance") or "https://yewtu.be").strip()
             try:
                 if use_invid:
-                    self.provider = InvidiousProvider(invid_base, proxy=proxy, fallback=YTDLPProvider(proxy or None))
+                    self.provider = InvidiousProvider(invid_base, proxy=proxy, fallback=YTDLPProvider(proxy))
                 else:
-                    self.provider = YTDLPProvider(proxy or None)
+                    self.provider = YTDLPProvider(proxy)
                 # Reapply cookies to provider on reconfigure
-                if isinstance(self.provider, YTDLPProvider):
-                    spec = self._cookies_spec_for_ytdlp()
-                    if spec:
+                spec = self._cookies_spec_for_ytdlp()
+                if spec:
+                    if isinstance(self.provider, YTDLPProvider):
                         self.provider.set_cookies_from_browser(spec)
+                    elif isinstance(self.provider, InvidiousProvider):
+                        # Set cookies on the fallback YTDLPProvider for InvidiousProvider
+                        self.provider._fallback.set_cookies_from_browser(spec)
             except Exception:
                 # fallback to yt-dlp
-                self.provider = YTDLPProvider(proxy or None)
+                self.provider = YTDLPProvider(proxy)
             # Update concurrency at runtime
             self.download_manager.set_max_concurrent(int(self.settings.get("max_concurrent_downloads") or 3))
             # Update MPV controls visibility preference immediately
@@ -673,6 +1016,9 @@ class MainWindow(Adw.ApplicationWindow):
         child = self.results_box.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
+            # Call cleanup if it's a ResultRow to cancel thumbnail loading
+            if hasattr(child, 'cancel_thumbnail_loading'):
+                child.cancel_thumbnail_loading()
             self.results_box.remove(child)
             child = nxt
 
@@ -722,13 +1068,95 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_quick_download(self, *_a) -> None:
         QuickDownloadWindow(self).present()
 
+    def _on_watch_later(self, *_a) -> None:
+        """Show watch later queue, filtering out watched videos"""
+        from .subscription_feed import is_watched
+        
+        vids = list_watch_later()
+        
+        if not vids:
+            self._clear_results()
+            self.results_box.append(Gtk.Label(label="No videos in Watch Later.\n\nClick 'Watch Later' on any video to add it here."))
+            self.navigation_controller.show_view("results")
+            return
+        
+        # Filter out watched videos
+        unwatched = [v for v in vids if not is_watched(v.id)]
+        
+        if not unwatched:
+            self._clear_results()
+            self.results_box.append(Gtk.Label(label="All videos in Watch Later have been watched!\n\nGreat job!"))
+            self.navigation_controller.show_view("results")
+            return
+        
+        self._populate_results(unwatched)
+        self.navigation_controller.show_view("results")
+
     def _on_feed(self, *_a) -> None:
-        # Show loading, then fetch recent uploads from each followed channel
-        self._show_loading("Loading feed…", cancellable=True)
+        """Show subscription feed - use fast authenticated feed if available"""
+        # Check if we have an authenticated Invidious token
+        # Try secure storage first
+        try:
+            from .invidious_auth import InvidiousAuth
+            auth_helper = InvidiousAuth("")
+            token = auth_helper._get_secure_token()
+            
+            if not token:
+                # Fall back to plain text settings
+                token = self.settings.get("invidious_token", "")
+        except Exception:
+            # Fall back to plain text settings
+            token = self.settings.get("invidious_token", "")
+        
+        instance_url = self.settings.get("invidious_instance", "https://yewtu.be").strip()
+        
+        if token and instance_url:
+            # Try to use fast authenticated feed
+            try:
+                from .invidious_auth import InvidiousAuth
+                
+                # Create auth instance and set token
+                auth = InvidiousAuth(instance_url)
+                auth.token = token
+                
+                # Use fast authenticated feed
+                self._show_loading("Loading feed (authenticated)...", cancellable=True)
+                
+                def worker():
+                    try:
+                        # Get feed from authenticated endpoint
+                        feed_data = auth.get_feed(max_results=60)
+                        
+                        # Convert dicts to Video objects
+                        from .providers.ytdlp import _entry_to_video
+                        vids = [_entry_to_video(item) for item in feed_data if isinstance(item, dict)]
+                        
+                        GLib.idle_add(self._populate_results, vids)
+                    except Exception as e:
+                        import logging
+                        logging.exception("Authenticated feed failed: %s", e)
+                        # Fall back to slow method
+                        GLib.idle_add(self._on_feed_slow_fallback)
+                
+                threading.Thread(target=worker, daemon=True).start()
+                return
+            except Exception as e:
+                import logging
+                logging.exception("Failed to initialize authenticated feed: %s", e)
+                # Fall back to slow method
+                self._on_feed_slow_fallback()
+        else:
+            # Use slow fallback method
+            self._on_feed_slow_fallback()
+    
+    def _on_feed_slow_fallback(self, *_a) -> None:
+        """Slow fallback method: fetch recent uploads from each followed channel"""
+        self._show_loading("Loading feed (slow)...", cancellable=True)
 
         def worker():
             vids_all = []
             try:
+                from .subscriptions import list_subscriptions
                 subs = list_subscriptions()
                 for sub in subs:
                     try:
@@ -743,11 +1171,17 @@ class MainWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_trending(self, *_a) -> None:
+        import logging
+        log = logging.getLogger("trending.debug")
+        log.debug("_on_trending called")
+        print("_on_trending called")
         self._show_loading("Loading trending…", cancellable=True)
         def worker():
             try:
                 vids = self.provider.trending()
             except Exception:
+                import logging
+                logging.getLogger("trending.debug").exception("Error in trending worker")
                 vids = []
             def show():
                 self._populate_results(vids)
@@ -762,6 +1196,10 @@ class MainWindow(Adw.ApplicationWindow):
     # ---------- Search ----------
 
     def _on_search_activate(self, entry: Gtk.SearchEntry) -> None:
+        import logging
+        log = logging.getLogger("search.debug")
+        log.debug("Search activate called")
+        print("Search activate called")
         search.on_search_activate(entry, self._run_search)
 
     def _run_search(self, query: str) -> None:
@@ -777,6 +1215,7 @@ class MainWindow(Adw.ApplicationWindow):
             limit=DEFAULT_SEARCH_LIMIT,
             last_filters=self._last_filters,
             timed_func=timed,
+            search_lock=self._search_lock,  # Pass the lock for thread safety
         )
 
     def _set_search_generation(self, gen: int) -> int:
@@ -816,8 +1255,14 @@ class MainWindow(Adw.ApplicationWindow):
                 followed=is_followed(v.url) if v.kind == "channel" else False,
                 on_open_channel=lambda video: self._open_channel_from_video(video),
                 on_toast=self._show_toast,
+                get_setting=self.settings.get,  # NEW - pass settings getter
+                on_quick_download=self._quick_download_video,  # NEW - pass handler
             )
             self.results_box.append(row)
+
+    def _quick_download_video(self, video: Video, opts: DownloadOptions) -> None:
+        """Handle quick quality download"""
+        self.download_manager.start_download(video, opts)
 
     def _follow_channel(self, video: Video) -> None:
         try:
@@ -944,15 +1389,23 @@ class MainWindow(Adw.ApplicationWindow):
         profile = (self.settings.get("mpv_cookies_profile") or "").strip()
         container = (self.settings.get("mpv_cookies_container") or "").strip()
         
-        # Construct the specification string according to yt-dlp format: browser[+keyring][:profile][::container]
+        # Construct: browser[+keyring][:profile][::container]
         val = browser
         if keyring:
             val += f"+{keyring}"
-        # Only add profile and container if they exist
-        if profile or container:
-            val += f":{profile or ''}"
-        if container:
+        
+        # Handle profile and container correctly
+        if profile and container:
+            # Both present: browser:profile::container
+            val += f":{profile}::{container}"
+        elif profile:
+            # Only profile: browser:profile
+            val += f":{profile}"
+        elif container:
+            # Only container: browser::container
             val += f"::{container}"
+        # If neither, val stays as browser or browser+keyring
+        
         return val
 
     # ---------- Downloads ----------

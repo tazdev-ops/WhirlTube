@@ -13,10 +13,9 @@ from ..models import Video
 from ..mpv_embed import MpvWidget
 from ..player import has_mpv, start_mpv, mpv_send_cmd
 from ..app import APP_ID
-from ..util import safe_httpx_proxy
+from .native_resolver import get_ios_hls
 
-import gi
-from gi.repository import Gio, GLib, Gdk
+from gi.repository import GLib, Gdk
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ class PlaybackService:
         self._ipc: str | None = None
         self._current_url: str | None = None
         self._speed = 1.0
+        self.native_playback_enabled = False
         # Callbacks for UI updates
         self._on_started_callback = None
         self._on_stopped_callback = None
@@ -37,6 +37,21 @@ class PlaybackService:
         """Set callbacks for playback events"""
         self._on_started_callback = on_started
         self._on_stopped_callback = on_stopped
+
+    # Helper methods for IPC property access
+    def get_ipc_path(self) -> str | None:
+        """Get IPC socket path for external MPV"""
+        return self._ipc
+
+    def get_ipc_property(self, name: str):
+        """Get property from external MPV via IPC"""
+        if not self._ipc:
+            return None
+        try:
+            r = mpv_send_cmd(self._ipc, ["get_property", name])
+            return r.get("data") if isinstance(r, dict) else None
+        except Exception:
+            return None
 
     def play(
         self, 
@@ -59,6 +74,24 @@ class PlaybackService:
         session = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
         is_wayland = session == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
 
+        # --- Native Playback Resolution ---
+        play_url = video.url
+        yt_id = self._extract_video_id(video.url)
+        native_url = None
+        
+        if yt_id and self.native_playback_enabled:
+            log.debug("Native playback enabled. Attempting to resolve iOS HLS URL.")
+            try:
+                # Use hardcoded hl/gl for native resolver for now
+                native_url = get_ios_hls(yt_id, hl="en", gl="US")
+                if native_url:
+                    play_url = native_url
+                    log.debug("Resolved native HLS URL.")
+                else:
+                    log.debug("Native HLS resolution failed. Falling back to yt-dlp.")
+            except Exception as e:
+                log.warning("Error during native HLS resolution: %s", e)
+        
         # Quality preset -> ytdl-format
         ytdl_fmt_val = None
         if quality and quality != "auto":
@@ -79,37 +112,7 @@ class PlaybackService:
         if ytdl_fmt_val:
             mpv_args_list.append(f'--ytdl-format={ytdl_fmt_val}')
 
-        # Build ytdl-raw-options map (cookies + sponsorblock + optional proxy)
-        ytdl_raw: dict[str, str] = {}
-
-        if cookies_enabled:
-            val = self._cookie_spec(cookies_browser, cookies_keyring, cookies_profile, cookies_container)
-            if val:
-                ytdl_raw["cookies-from-browser"] = val
-
-        # SponsorBlock for playback: mark chapters or auto-skip if script is present
-        sb_mode_l = (sb_mode or "mark").strip().lower()
-        if sb_enabled:
-            cats = (sb_categories or "default").strip()
-            # Escape commas for mpv CLI in case they appear (e.g., "all,-preview")
-            cats_cli = cats.replace(",", r"\,")
-            if sb_mode_l == "mark":
-                ytdl_raw["sponsorblock-mark"] = cats_cli
-            elif sb_mode_l in ("skip", "autoskip"):
-                # Best effort: still mark chapters for visibility
-                ytdl_raw["sponsorblock-mark"] = cats_cli
-                # And try to load sponsorblock.lua to auto-skip
-                sb_script = self._find_sponsorblock_script()
-                if sb_script:
-                    mpv_args_list.append(f"--script={sb_script}")
-                else:
-                    log.debug("SponsorBlock autoskip requested, but sponsorblock.lua not found; chapters will be marked only")
-
         # Fullscreen
-        if fullscreen:
-            mpv_args_list.append("--fs")
-
-        # Add platform-specific args
         from ..player import mpv_supports_option
         extra_platform_args = []
         if is_wayland and mpv_supports_option("wayland-app-id"):
@@ -117,6 +120,34 @@ class PlaybackService:
         if not is_wayland and mpv_supports_option("class"):
             extra_platform_args.append(f"--class={APP_ID}")
         final_mpv_args_list = mpv_args_list + extra_platform_args
+
+        # Build ytdl-raw-options map (cookies + optional proxy - sponsorblock handled separately)
+        ytdl_raw: dict[str, str] = {}
+
+        if cookies_enabled:
+            val = self._cookie_spec(cookies_browser, cookies_keyring, cookies_profile, cookies_container)
+            if val:
+                ytdl_raw["cookies-from-browser"] = val
+
+        # SponsorBlock for external MPV: use Lua script approach only
+        sb_mode_l = (sb_mode or "mark").strip().lower()
+        if sb_enabled and playback_mode != "embedded":
+            script_dir = Path(__file__).parent.parent / "assets" / "scripts"
+            script_path = script_dir / "sponsorblock.lua"
+            if script_path.exists():
+                final_mpv_args_list += ["--script", str(script_path)]
+                # Map to Lua script config
+                sb_opts = [
+                    f"sponsorblock-categories={sb_categories or 'sponsor,intro'}",
+                    f"sponsorblock-skip_categories={sb_categories if sb_mode_l=='skip' else ''}",
+                    "sponsorblock-local_database=no",
+                    "sponsorblock-make_chapters=yes",
+                ]
+                final_mpv_args_list += ["--script-opts=" + ",".join(sb_opts)]
+        
+        # For embedded mode: SponsorBlock features may be limited to what MPV supports directly
+        # The ytdl-raw-options approach for SponsorBlock doesn't work properly as these are post-processing options
+        # So we only handle external MPV with Lua script; embedded will not have SponsorBlock support
 
         # Embedded path
         if playback_mode == "embedded":
@@ -134,7 +165,7 @@ class PlaybackService:
                 self.mpv_widget.set_ytdl_raw_options(raw_opts)
             except Exception:
                 pass
-            ok = self.mpv_widget.play(video.url)
+            ok = self.mpv_widget.play(play_url)
             if ok:
                 log.debug("Embedded playback started successfully")
                 if self._on_started_callback:
@@ -170,7 +201,7 @@ class PlaybackService:
         log.debug("Launching mpv: args=%s proxy=%s", final_mpv_args_list, bool(http_proxy))
         try:
             proc = start_mpv(
-                video.url,
+                play_url,
                 extra_args=final_mpv_args_list,
                 ipc_server_path=ipc_path,
                 extra_env=extra_env,
@@ -178,16 +209,35 @@ class PlaybackService:
             )
             self._proc = proc
             self._ipc = ipc_path
-            self._current_url = video.url
+            self._current_url = video.url # Store original URL for timestamp copying
             self._speed = 1.0
             if self._on_started_callback:
                 self._on_started_callback("external")
             def _watch():
+                """Watch process and clean up on exit"""
                 try:
-                    proc.wait()
-                except Exception:
-                    pass
-                GLib.idle_add(self._on_external_mpv_exit)
+                    # Keep local reference to IPC path for cleanup
+                    ipc_to_clean = ipc_path
+                    exit_code = proc.wait()  # Use local proc variable
+                    log.debug(f"MPV process exited with code {exit_code}")
+                except Exception as e:
+                    log.warning(f"Error waiting for MPV process: {e}")
+                    ipc_to_clean = ipc_path
+                
+                # Clean up IPC socket regardless of how we got here
+                try:
+                    if ipc_to_clean and os.path.exists(ipc_to_clean):
+                        os.remove(ipc_to_clean)
+                        log.debug(f"Cleaned up IPC socket: {ipc_to_clean}")
+                except Exception as e:
+                    log.warning(f"Failed to clean IPC socket {ipc_to_clean}: {e}")
+                
+                # Schedule UI update on main thread
+                try:
+                    GLib.idle_add(self._on_external_mpv_exit)
+                except Exception as e:
+                    # App might be shutting down
+                    log.debug(f"Could not schedule MPV exit callback: {e}")
             threading.Thread(target=_watch, daemon=True).start()
             return True
         except Exception as e:
@@ -200,75 +250,67 @@ class PlaybackService:
 
     # --- helpers ---
 
+    def _extract_video_id(self, url: str) -> str | None:
+        """Extract YouTube video ID from URL"""
+        if not url:
+            return None
+        
+        # Handle various YouTube URL formats
+        import urllib.parse
+        try:
+            parsed = urllib.parse.urlparse(url)
+            
+            # Standard watch URL
+            if "youtube.com" in parsed.netloc and parsed.path == "/watch":
+                query = urllib.parse.parse_qs(parsed.query)
+                if "v" in query:
+                    return query["v"][0]
+            
+            # Short URL
+            if "youtu.be" in parsed.netloc:
+                return parsed.path.lstrip("/")
+            
+            # Embed URL
+            if "youtube.com" in parsed.netloc and "/embed/" in parsed.path:
+                parts = parsed.path.split("/embed/")
+                if len(parts) > 1:
+                    return parts[1].split("?")[0]
+            
+            # Watch URL with different format
+            if "youtube.com" in parsed.netloc and "/watch/" in parsed.path:
+                parts = parsed.path.split("/watch/")
+                if len(parts) > 1:
+                    query = urllib.parse.parse_qs(parsed.query)
+                    if "v" in query:
+                        return query["v"][0]
+        except Exception:
+            pass
+        
+        return None
+
     def _cookie_spec(self, browser: str, keyring: str, profile: str, container: str) -> str:
         if not browser:
             return ""
         val = browser
         if keyring:
             val += f"+{keyring}"
-        if profile or container:
+        
+        # Handle profile and container correctly
+        if profile and container:
+            val += f":{profile}::{container}"
+        elif profile:
             val += f":{profile}"
-        if container:
+        elif container:
             val += f"::{container}"
+        
         return val
 
-    def _find_sponsorblock_script(self) -> str | None:
-        # Try common system/user locations
-        candidates = [
-            os.path.expanduser("~/.config/mpv/scripts/sponsorblock.lua"),
-            "/usr/share/mpv/scripts/sponsorblock.lua",
-            "/usr/local/share/mpv/scripts/sponsorblock.lua",
-        ]
-        for p in candidates:
-            if os.path.isfile(p):
-                return p
-        return None
 
     def _format_ytdl_raw_cli(self, opts: dict[str, str]) -> str:
         """
         Build a single --ytdl-raw-options value like:
           cookies-from-browser=firefox,sponsorblock-mark=default
-        Values with commas are escaped as '\,' for mpv's parser.
-        """
-        parts = []
-        for k, v in opts.items():
-            if v is None:
-                continue
-            v = str(v)
-            if "," in v:
-                v = v.replace(",", r"\,")
-            parts.append(f"{k}={v}")
-        return ",".join(parts)
-
-    def _cookie_spec(self, browser: str, keyring: str, profile: str, container: str) -> str:
-        if not browser:
-            return ""
-        val = browser
-        if keyring:
-            val += f"+{keyring}"
-        if profile or container:
-            val += f":{profile}"
-        if container:
-            val += f"::{container}"
-        return val
-
-    def _find_sponsorblock_script(self) -> str | None:
-        # Try common system/user locations
-        candidates = [
-            os.path.expanduser("~/.config/mpv/scripts/sponsorblock.lua"),
-            "/usr/share/mpv/scripts/sponsorblock.lua",
-            "/usr/local/share/mpv/scripts/sponsorblock.lua",
-        ]
-        for p in candidates:
-            if os.path.isfile(p):
-                return p
-        return None
-
-    def _format_ytdl_raw_cli(self, opts: dict[str, str]) -> str:
-        """
-        Build a single --ytdl-raw-options value like:
-          cookies-from-browser=firefox,sponsorblock-mark=default
-        Values with commas are escaped as '\,' for mpv's parser.
+        Values with commas are escaped as '\\,' for mpv's parser.
         """
         parts = []
         for k, v in opts.items():
@@ -369,9 +411,12 @@ class PlaybackService:
             except Exception:
                 pass
             return
+        
         # External path: prefer quit over kill where possible
-        if self._ipc:
-            mpv_send_cmd(self._ipc, ["quit"])
+        ipc_path = self._ipc
+        if ipc_path:
+            mpv_send_cmd(ipc_path, ["quit"])
+        
         proc = self._proc
         if proc:
             try:
@@ -385,8 +430,18 @@ class PlaybackService:
                     proc.kill()
                 except Exception:
                     pass
+        
+        # Clean up IPC socket
+        if ipc_path and os.path.exists(ipc_path):
+            try:
+                os.remove(ipc_path)
+                log.debug(f"Removed IPC socket: {ipc_path}")
+            except OSError as e:
+                log.warning(f"Failed to remove IPC socket {ipc_path}: {e}")
+        
         self._proc = None
         self._ipc = None
+        self._current_url = None
 
     def copy_timestamp(self) -> str | None:
         """Get current timestamp for external MPV or embedded and return URL with timestamp"""
@@ -430,6 +485,7 @@ class PlaybackService:
         if not timestamp_url:
             return False
         
+        disp = None
         try:
             disp = Gdk.Display.get_default()
             if not disp:
@@ -441,16 +497,19 @@ class PlaybackService:
             clipboard.set_content(self._clipboard_provider)
             return True
         except Exception:
-            # Fallback to primary
-            try:
-                if disp:
-                    primary = disp.get_primary_clipboard()
-                    if primary:
-                        self._clipboard_provider_primary = Gdk.ContentProvider.new_for_value(timestamp_url)
-                        primary.set_content(self._clipboard_provider_primary)
-                return True
-            except Exception:
-                pass
+            pass
+        
+        # Fallback to primary
+        try:
+            if disp:  # Now disp is always defined
+                primary = disp.get_primary_clipboard()
+                if primary:
+                    self._clipboard_provider_primary = Gdk.ContentProvider.new_for_value(timestamp_url)
+                    primary.set_content(self._clipboard_provider_primary)
+                    return True
+        except Exception:
+            pass
+        
         return False
 
     def cleanup(self):

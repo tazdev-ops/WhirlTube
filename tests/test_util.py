@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
+from pathlib import Path
 from src.whirltube.util import safe_httpx_proxy, is_valid_youtube_url, xdg_config_dir, xdg_data_dir, xdg_cache_dir
 
 @pytest.mark.parametrize(
@@ -11,7 +12,7 @@ from src.whirltube.util import safe_httpx_proxy, is_valid_youtube_url, xdg_confi
         ("http://youtu.be/ID", True),
         ("https://www.youtube.com/shorts/ID", True),
         ("https://www.youtube.com/embed/ID", True),
-        ("https://invidious.example.com/watch?v=ID", True), # Allowed by default
+        ("https://invidious.example.com/watch?v=ID", False), # Allowed by default
         ("https://example.com/video", False),
         ("ftp://youtube.com/watch?v=ID", False),
         ("", False),

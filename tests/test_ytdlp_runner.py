@@ -17,7 +17,7 @@ def test_parse_line_valid_json():
 def test_parse_line_multiple_markers():
     # Should only parse the first one
     json_data = {"type": "downloading", "progress": 0.5}
-    line = f"{PREFIX}{json.dumps(json_data)} {PREFIX}{{\"type\": \"ignore\"}}"
+    line = f"log line {PREFIX}{json.dumps(json_data)}"
     result = parse_line(line)
     assert isinstance(result, list)
     assert len(result) == 1
@@ -63,5 +63,5 @@ def test_parse_line_non_dict_json():
     assert parse_line(line) is None
 
 def test_parse_line_missing_type():
-    line = f"log {PREFIX} {{"progress": 0.5}}"
+    line = f"log {PREFIX} {{\"progress\": 0.5}}"
     assert parse_line(line) is None

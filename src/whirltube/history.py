@@ -64,3 +64,110 @@ def list_watch(limit: int = 200) -> list[Video]:
         except Exception:
             continue
     return out
+
+
+def list_search_history(limit: int = 20) -> list[str]:
+    """
+    Get recent unique search terms for autocomplete.
+    
+    Args:
+        limit: Maximum number of terms to return
+        
+    Returns:
+        List of search terms, most recent first
+    """
+    if not SEARCH.exists():
+        return []
+    
+    try:
+        lines = SEARCH.read_text(encoding="utf-8").splitlines()
+        
+        # Extract search terms (skip timestamp)
+        terms = []
+        seen = set()
+        
+        # Process in reverse (most recent first)
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            
+            # Format: "TIMESTAMP\tQUERY"
+            parts = line.split('\t', 1)
+            if len(parts) == 2:
+                term = parts[1].strip()
+                # Only add if we haven't seen it (dedup)
+                if term and term not in seen:
+                    terms.append(term)
+                    seen.add(term)
+                    
+                    if len(terms) >= limit:
+                        break
+        
+        return terms
+        
+    except Exception as e:
+        from .util import log
+        log.debug(f"Failed to list search history: {e}")
+        return []
+
+
+def search_history_suggestions(prefix: str, limit: int = 10) -> list[str]:
+    """
+    Get search suggestions based on prefix matching.
+    
+    Args:
+        prefix: Search prefix to match
+        limit: Maximum suggestions to return
+        
+    Returns:
+        List of matching search terms
+    """
+    if not prefix or not prefix.strip():
+        # Return recent searches if no prefix
+        return list_search_history(limit)
+    
+    prefix_lower = prefix.strip().lower()
+    all_terms = list_search_history(limit * 3)  # Get more to filter
+    
+    # Filter by prefix match
+    matches = [term for term in all_terms if term.lower().startswith(prefix_lower)]
+    
+    return matches[:limit]
+
+
+def clear_search_history() -> int:
+    """
+    Clear all search history.
+    
+    Returns:
+        Number of entries cleared
+    """
+    if not SEARCH.exists():
+        return 0
+    
+    try:
+        count = len(SEARCH.read_text(encoding="utf-8").splitlines())
+        SEARCH.unlink()
+        from .util import log
+        log.info(f"Cleared {count} search history entries")
+        return count
+    except Exception as e:
+        from .util import log
+        log.exception(f"Failed to clear search history: {e}")
+        return 0
+
+
+def get_search_history_count() -> int:
+    """
+    Get count of search history entries.
+    
+    Returns:
+        Number of searches
+    """
+    if not SEARCH.exists():
+        return 0
+    
+    try:
+        return len([line for line in SEARCH.read_text(encoding="utf-8").splitlines() if line.strip()])
+    except Exception:
+        return 0

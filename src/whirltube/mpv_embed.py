@@ -71,11 +71,31 @@ class MpvWidget(Gtk.Box):
             return
         xid = GdkX11.X11Surface.get_xid(surface)
         try:
+            # Set locale for libmpv (client.h requirement)
+            try:
+                import locale
+                locale.setlocale(locale.LC_NUMERIC, "C")
+            except Exception:
+                pass
+            
             # Basic, usable defaults. More can be set later via setters below.
             self._mpv = mpv.MPV(
                 wid=str(xid),
                 ytdl=True, osc=True, input_default_bindings=True, config=True, keep_open=True,
             )
+            
+            # Use property observers instead of polling for better performance
+            @self._mpv.property_observer('time-pos')
+            def _time_observer(_name, val):
+                # This will be called whenever time-pos changes
+                # Hook into controls/overlay as needed
+                pass
+
+            @self._mpv.property_observer('pause')
+            def _pause_observer(_name, paused):
+                # This will be called whenever pause state changes
+                pass
+            
             self._ready = True
             self._fallback.set_visible(False)
         except Exception as e:

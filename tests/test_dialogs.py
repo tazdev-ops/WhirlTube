@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 from src.whirltube.dialogs import DownloadOptions
 from pathlib import Path
 
@@ -9,7 +8,7 @@ def test_download_options_default_to_ydl_opts():
     ydl_opts = opts.to_ydl_opts()
     assert ydl_opts["format"] == "bv*+ba/b"
     assert ydl_opts["quiet"] is True
-    assert ydl_opts["writesubtitles"] is not True
+    assert "writesubtitles" not in ydl_opts
 
 def test_download_options_custom_format_to_ydl_opts():
     opts = DownloadOptions(quality_mode="custom", custom_format="bestvideo[height<=1080]+bestaudio")

@@ -30,6 +30,12 @@ class InvidiousProvider(Provider):
     """
     def __init__(self, base_url: str, proxy: str | None = None, fallback: YTDLPProvider | None = None) -> None:
         self.cfg = _Cfg(base=base_url.rstrip("/"), proxy=proxy)
+        
+        # Ensure fallback is YTDLPProvider, not InvidiousProvider
+        if fallback and not isinstance(fallback, YTDLPProvider):
+            log.warning(f"Invalid fallback type: {type(fallback)}, using default YTDLPProvider")
+            fallback = None
+        
         self._fallback = fallback or YTDLPProvider()
         self._client: httpx.Client | None = None
         self._init_client()
@@ -238,6 +244,22 @@ class InvidiousProvider(Provider):
             except Exception:
                 continue
         return vids
+
+    def suggestions(self, query: str) -> list[str]:
+        q = (query or "").strip()
+        if not q:
+            return []
+        params = {"q": q}
+        try:
+            data = self._robust_api_call("/api/v1/search/suggestions", params=params)
+            if isinstance(data, dict):
+                suggestions = data.get("suggestions")
+                if isinstance(suggestions, list):
+                    return [str(s) for s in suggestions if isinstance(s, str)]
+        except RuntimeError as e:
+            log.debug("Invidious suggestions failed (%s); fallback", e)
+            return self._fallback.suggestions(query)
+        return []
 
     # ---------- Browse helpers ----------
 

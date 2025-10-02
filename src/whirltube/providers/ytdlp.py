@@ -16,8 +16,6 @@ _BASE_OPTS = {
     "nocheckcertificate": True,
     "retries": 3,
     "fragment_retries": 2,
-    # Use Android client to bypass consent/region walls
-    "extractor_args": {"youtube": {"player_client": "android"}},
     # Hint language/region + UA to reduce redirects
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -43,7 +41,7 @@ class YTDLPProvider(Provider):
         self._reinit()
 
     def _parse_cookie_spec(self, spec: str) -> tuple[str | None, str | None, str | None, str | None]:
-        """Parse yt-dlp cookie spec string into (browser, profile, keyring, container) tuple."""
+        """Parse yt-dlp cookie spec string into (browser, keyring, profile, container) tuple."""
         if not spec:
             return None, None, None, None
 
@@ -74,7 +72,7 @@ class YTDLPProvider(Provider):
                 profile = profile_part if profile_part else None
                 container = None
 
-        return browser, profile, keyring, container
+        return browser, profile, keyring, container  # yt-dlp expects (browser, profile, keyring, container)
 
 
     def set_cookies_from_browser(self, spec: str | None) -> None:
@@ -108,9 +106,9 @@ class YTDLPProvider(Provider):
                     return
 
                 # Parse the spec into tuple for yt-dlp API
-                browser, profile, keyring, container = self._parse_cookie_spec(clean_spec)
+                browser, profile, keyring, container = self._parse_cookie_spec(clean_spec)  # Unpack in correct order: browser, profile, keyring, container
                 if browser:  # Only set if valid browser
-                    self._opts_base["cookiesfrombrowser"] = (browser, profile, keyring, container)
+                    self._opts_base["cookiesfrombrowser"] = (browser, profile, keyring, container)  # yt-dlp expects (browser, profile, keyring, container)
                 else:
                     log.warning(f"Invalid browser in cookie spec: {clean_spec}, skipping")
             except Exception as e:
@@ -119,30 +117,24 @@ class YTDLPProvider(Provider):
         self._reinit()
 
     def _reinit(self) -> None:
-        # Sanitize the options before creating YoutubeDL instances to prevent cookie parsing errors
+        # Sanitize the options before creating YoutubeDL instances
         opts_base = dict(self._opts_base)
         if "cookiesfrombrowser" in opts_base:
             cookie_spec = opts_base["cookiesfrombrowser"]
             valid = True
+            
             if isinstance(cookie_spec, str):
-                # Basic validation to prevent too many colons that can cause _parse_browser_specification to fail
-                # Format should be: browser+keyring:profile::container (max ~4 conceptual parts)
-                # Split by ':' and make sure no part has excessive '::' combinations
-                parts = cookie_spec.split(':')
-                if len(parts) > 4:  # Likely malformed
-                    log.warning(f"Invalid cookie spec format (too many parts): {cookie_spec}")
-                    valid = False
-                else:
-                    # Check individual parts for invalid patterns
-                    for part in parts:
-                        # If a part has multiple '::' separators, that might be problematic
-                        sub_parts = part.split('::')
-                        if len(sub_parts) > 2:  # More than one '::' separator in a part
-                            valid = False
-                            break
+                # We should have already parsed this to tuple in set_cookies_from_browser
+                # If it's still a string, something went wrong
+                log.warning(f"cookiesfrombrowser is still a string, should be tuple: {cookie_spec}")
+                valid = False
             elif isinstance(cookie_spec, (list, tuple)):
+                # Validate tuple format: (browser, profile, keyring, container)
                 if not (1 <= len(cookie_spec) <= 4):
                     log.warning(f"Invalid cookie spec tuple length: {len(cookie_spec)}")
+                    valid = False
+                elif not cookie_spec[0]:  # browser must be non-empty
+                    log.warning("Invalid cookie spec: browser is empty")
                     valid = False
             else:
                 log.warning(f"Invalid type for cookiesfrombrowser: {type(cookie_spec)}")
@@ -257,10 +249,23 @@ class YTDLPProvider(Provider):
         
         # First try with normal settings (including proxy if configured)
         last_exc = None
+        # Create a new instance with timeout settings
+        timeout_opts = dict(
+            self._opts_base,
+            **{
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "socket_timeout": 10,  # Add timeout
+                "extractor_retries": 2,  # Limit retries
+                "ignoreerrors": True,  # Don't crash
+            }
+        )
+        ydl_timeout = YoutubeDL(timeout_opts)
+        
         for url in urls:
             log.debug("yt-dlp browse trending: %s", url)
             try:
-                data = self._ydl_flat.extract_info(url, download=False)
+                data = ydl_timeout.extract_info(url, download=False)
                 if not isinstance(data, dict):
                     continue
                 entries = data.get("entries") or []
@@ -278,7 +283,16 @@ class YTDLPProvider(Provider):
             try:
                 # Create a temporary YoutubeDL without proxy
                 opts_no_proxy = {k: v for k, v in self._opts_base.items() if k != "proxy"}
-                ydl_no_proxy = YoutubeDL(dict(opts_no_proxy, **{"skip_download": True, "extract_flat": "in_playlist"}))
+                ydl_no_proxy = YoutubeDL(dict(
+                    opts_no_proxy,
+                    **{
+                        "skip_download": True,
+                        "extract_flat": "in_playlist",
+                        "socket_timeout": 10,  # Add timeout
+                        "extractor_retries": 2,  # Limit retries
+                        "ignoreerrors": True,  # Don't crash
+                    }
+                ))
                 
                 for url in urls:
                     log.debug("yt-dlp browse trending (no proxy): %s", url)
@@ -298,7 +312,7 @@ class YTDLPProvider(Provider):
                 log.debug("trending no-proxy attempt failed: %s", e)
         
         if last_exc:
-            log.exception("trending failed: %s", last_exc)
+            log.warning("trending failed: %s", last_exc)
         return []
 
     def browse_url(self, url: str) -> list[Video]:
@@ -395,34 +409,46 @@ class YTDLPProvider(Provider):
 
     def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
         """Fetch top-level comments when available via yt-dlp API."""
-        opts = dict(self._opts_base, **{"skip_download": True, "getcomments": True})
-        # Optional: nudge yt-dlp comment behavior (doesn't hurt):
-        # opts.setdefault("extractor_args", {"youtube": {"comment_sort": ["top"]}})
-        y = YoutubeDL(opts)
+        opts = dict(self._opts_base, **{
+            "skip_download": True,
+            "getcomments": True,
+            "socket_timeout": 5,           # Abort socket after 5s
+            "extractor_retries": 1,         # Only retry once
+            "fragment_retries": 0,
+            "ignoreerrors": True,           # Don't crash on errors
+        })
+        
+        # NEW: Use separate YoutubeDL instance to avoid state pollution
         try:
-            info = y.extract_info(video_url, download=False)
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
         except Exception as e:
-            log.exception("comments failed: %s", e)
+            log.warning(f"Comment extraction failed: {e}")
             return []
+        
+        if not isinstance(info, dict):
+            return []
+        
         comments = info.get("comments") or []
+        
+        # CRITICAL: Limit iteration immediately
         out: list[Video] = []
-        for i, c in enumerate(comments):
-            if i >= max_comments:
-                break
+        for i, c in enumerate(comments[:max_comments]):  # Slice BEFORE iterating
             comment_id = c.get("id") or c.get("comment_id") or ""
-            author = c.get("author") or c.get("uploader") or "Comment"
+            author = c.get("author") or "Comment"
+            text = (c.get("text") or "(empty)")[:200]  # Truncate long comments
             url = f"{video_url}&lc={comment_id}" if comment_id else video_url
-            out.append(
-                Video(
-                    id=str(comment_id),
-                    title=author,
-                    url=url,
-                    channel=author,
-                    duration=None,
-                    thumb_url=None,
-                    kind="comment",
-                )
-            )
+            
+            out.append(Video(
+                id=str(comment_id),
+                title=text,
+                url=url,
+                channel=author,
+                duration=None,
+                thumb_url=None,
+                kind="comment",
+            ))
+        
         return out
 
     def fetch_formats(self, url: str) -> list[tuple[str, str]]:
@@ -444,6 +470,9 @@ class YTDLPProvider(Provider):
             out.append((fid, label))
         return out
 
+    def suggestions(self, query: str) -> list[str]:
+        return []
+
 
 def _entry_to_video(e: dict) -> Video:
     vid = e.get("id") or e.get("url") or ""
@@ -452,6 +481,12 @@ def _entry_to_video(e: dict) -> Video:
     channel = e.get("channel") or e.get("uploader")
     duration = e.get("duration")
     thumb = _pick_thumb(e.get("thumbnails"))
+    
+    # NEW: Extract view count
+    view_count = e.get("view_count")
+    
+    # NEW: Extract upload date
+    upload_date = e.get("upload_date")  # YYYYMMDD format
 
     # Kind inference
     kind = "video"
@@ -480,6 +515,8 @@ def _entry_to_video(e: dict) -> Video:
         duration=int(duration) if duration else None,
         thumb_url=thumb,
         kind=kind,
+        view_count=int(view_count) if view_count else None,  # NEW
+        upload_date=upload_date,  # NEW
     )
 
 def _info_to_video(info: dict) -> Video:
