@@ -8,12 +8,34 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import re
 
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gio, GLib, Gtk, Gdk
 
 from . import __version__
 from .dialogs import DownloadOptions, DownloadOptionsWindow, PreferencesWindow
-from .history import add_search_term, add_watch, list_watch
+from .history import add_search_term, add_watch, list_watch, search_history_suggestions, clear_search_history, get_search_history_count
+from .subscription_feed import is_watched
 from .models import Video
 from .mpv_embed import MpvWidget
+from .providers.ytdlp import YTDLPProvider
+from .providers.invidious import InvidiousProvider
+from .download_manager import DownloadManager
+from .navigation_controller import NavigationController
+from .download_history import list_downloads
+from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
+from .watch_later import list_watch_later, clear_watch_later, get_watch_later_count
+from .thumbnail_cache import clear_cache as clear_thumbnail_cache, get_cache_stats, cleanup_old_cache, enforce_cache_size_limit
+from .quickdownload import QuickDownloadWindow
+from .ui.widgets.result_row import ResultRow
+from .ui.widgets.mpv_controls import MpvControls
+from .services.playback import PlaybackService
+from .ui.controllers import search
+from .metrics import timed
+from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
 
 # Use GL-based widget for Wayland compatibility if available
 # Prefer GL widget on Wayland, fallback to X11 widget on X11
@@ -27,43 +49,6 @@ except ImportError:
 # Detect session type for better widget selection
 SESSION_TYPE = (os.environ.get("XDG_SESSION_TYPE") or "").lower()
 IS_WAYLAND = SESSION_TYPE == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
-from .providers.ytdlp import YTDLPProvider
-from .providers.invidious import InvidiousProvider
-from .download_manager import DownloadManager
-from .navigation_controller import NavigationController
-from .download_history import list_downloads
-from .subscriptions import is_followed, add_subscription, remove_subscription, list_subscriptions, export_subscriptions, import_subscriptions
-from .watch_later import (
-    list_watch_later,
-    clear_watch_later,
-    get_watch_later_count,
-)
-from .thumbnail_cache import (
-    clear_cache as clear_thumbnail_cache,
-    get_cache_stats,
-    cleanup_old_cache,
-    enforce_cache_size_limit,
-)
-from .history import (
-    search_history_suggestions,
-    clear_search_history,
-    get_search_history_count,
-)
-from .quickdownload import QuickDownloadWindow
-from .ui.widgets.result_row import ResultRow
-from .ui.widgets.mpv_controls import MpvControls
-from .services.playback import PlaybackService
-from .ui.controllers import search
-from .metrics import timed
-from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
-
-import gi
-from gi.repository import Adw, Gio, GLib, Gtk
-
-gi.require_version("Gtk", "4.0")
-gi.require_version("Adw", "1")
-gi.require_version("Gdk", "4.0")
-gi.require_version("GdkPixbuf", "2.0")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
 
@@ -133,17 +118,6 @@ class MainWindow(Adw.ApplicationWindow):
             gl = (self.settings.get("yt_gl") or "US").strip() or "US"
             self.provider = HybridProvider(InnerTubeWeb(hl=hl, gl=gl), fb)
         
-        # Pass cookies to provider as well (helps trending/region walls)
-        try:
-            spec = self._cookies_spec_for_ytdlp()
-            if spec:
-                if isinstance(self.provider, YTDLPProvider):
-                    self.provider.set_cookies_from_browser(spec)
-                elif isinstance(self.provider, InvidiousProvider):
-                    # Set cookies on the fallback YTDLPProvider for InvidiousProvider
-                    self.provider._fallback.set_cookies_from_browser(spec)
-        except Exception:
-            pass
         self._search_generation = 0
         self._search_lock = threading.Lock()
         self._thumb_loader_pool = ThreadPoolExecutor(max_workers=MAX_THUMB_WORKERS)
@@ -166,9 +140,21 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             # Fallback to X11 widget
             self.mpv_widget = MpvWidget()
-        self.playback_service = PlaybackService(self.mpv_widget)
+        self.playback_service = PlaybackService(self.mpv_widget, self.settings.get)
         self.playback_service.native_playback_enabled = bool(self.settings.get("native_playback"))
         self.mpv_controls = MpvControls(self.playback_service)
+        
+        # Pass cookies to provider as well (helps trending/region walls)
+        try:
+            spec = self.playback_service.get_cookie_spec()
+            if spec:
+                if isinstance(self.provider, YTDLPProvider):
+                    self.provider.set_cookies_from_browser(spec)
+                elif isinstance(self.provider, InvidiousProvider):
+                    # Set cookies on the fallback YTDLPProvider for InvidiousProvider
+                    self.provider._fallback.set_cookies_from_browser(spec)
+        except Exception:
+            pass
         
         # Add the MPV control bar as a top bar
         self.toolbar_view.add_top_bar(self.mpv_controls.get_ctrl_bar())
@@ -217,7 +203,7 @@ class MainWindow(Adw.ApplicationWindow):
         sections_menu.append("History", "win.history")
         sections_menu.append("Feed", "win.feed")
         sections_menu.append("Trending", "win.trending")
-        print("Menu item added for trending with action 'win.trending'")
+        log.debug("Menu item added for trending with action 'win.trending'")
         primary_menu.append_section("Browse", sections_menu)
 
         primary_btn = Gtk.MenuButton(icon_name="folder-open-symbolic")
@@ -239,9 +225,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.search.set_placeholder_text("Search YouTube…")
         header.set_title_widget(self.search)
         self.search.connect("activate", self._on_search_activate)
-        print("Connected 'activate' for search entry:", self.search)
+        log.debug("Connected 'activate' for search entry: %s", self.search)
         self.search.connect("search-changed", self._on_search_changed)
-        print("Connected 'search-changed' for search entry:", self.search)
+        log.debug("Connected 'search-changed' for search entry: %s", self.search)
 
         # Clear text when the user presses Escape or the clear icon
         def _stop_search(_entry, *_a):
@@ -366,10 +352,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._create_actions()
         
         # Debug: Print all window and app actions
-        print("Window actions:", list(self.list_actions()))
+        log.debug("Window actions: %s", list(self.list_actions()))
         app_obj = self.get_application()
         if app_obj:
-            print("App actions:", list(app_obj.list_actions()))
+            log.debug("App actions: %s", list(app_obj.list_actions()))
         
         self._set_welcome()
         self._install_shortcuts()
@@ -598,43 +584,43 @@ class MainWindow(Adw.ApplicationWindow):
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
-        print("Added action: about")
+        log.debug("Added action: about")
 
         prefs = Gio.SimpleAction.new("preferences", None)
         prefs.connect("activate", self._on_preferences)
         self.add_action(prefs)
-        print("Added action: preferences")
+        log.debug("Added action: preferences")
 
         # Add the open URL action for Ctrl+L
         open_url = Gio.SimpleAction.new("open_url", None)
         open_url.connect("activate", self._on_open_url)
         self.add_action(open_url)
-        print("Added action: open_url")
+        log.debug("Added action: open_url")
         app = self.get_application()
         if app:
             app.set_accels_for_action("win.open_url", ["<Primary>L"])
-            print("Set accelerator for win.open_url: Ctrl+L")
+            log.debug("Set accelerator for win.open_url: Ctrl+L")
 
         shortcuts = Gio.SimpleAction.new("shortcuts", None)
         shortcuts.connect("activate", self._on_shortcuts)
         self.add_action(shortcuts)
-        print("Added action: shortcuts")
+        log.debug("Added action: shortcuts")
 
         # Browse actions
         history_action = Gio.SimpleAction.new("history", None)
         history_action.connect("activate", self._on_history)
         self.add_action(history_action)
-        print("Added action: history")
+        log.debug("Added action: history")
 
         feed_action = Gio.SimpleAction.new("feed", None)
         feed_action.connect("activate", self._on_feed)
         self.add_action(feed_action)
-        print("Added action: feed")
+        log.debug("Added action: feed")
 
         trending_action = Gio.SimpleAction.new("trending", None)
         trending_action.connect("activate", self._on_trending)
         self.add_action(trending_action)
-        print("Added action: trending")
+        log.debug("Added action: trending")
 
         # Quick Download action
         quick_download_action = Gio.SimpleAction.new("quick_download", None)
@@ -953,7 +939,7 @@ class MainWindow(Adw.ApplicationWindow):
                 else:
                     self.provider = YTDLPProvider(proxy)
                 # Reapply cookies to provider on reconfigure
-                spec = self._cookies_spec_for_ytdlp()
+                spec = self.playback_service.get_cookie_spec()
                 if spec:
                     if isinstance(self.provider, YTDLPProvider):
                         self.provider.set_cookies_from_browser(spec)
@@ -1174,7 +1160,6 @@ class MainWindow(Adw.ApplicationWindow):
         import logging
         log = logging.getLogger("trending.debug")
         log.debug("_on_trending called")
-        print("_on_trending called")
         self._show_loading("Loading trending…", cancellable=True)
         def worker():
             try:
@@ -1199,7 +1184,6 @@ class MainWindow(Adw.ApplicationWindow):
         import logging
         log = logging.getLogger("search.debug")
         log.debug("Search activate called")
-        print("Search activate called")
         search.on_search_activate(entry, self._run_search)
 
     def _run_search(self, query: str) -> None:
@@ -1316,45 +1300,10 @@ class MainWindow(Adw.ApplicationWindow):
         # Save to watch history
         add_watch(video)
 
-        mode = self.settings.get("playback_mode", "external")
-        mpv_args = self.settings.get("mpv_args", "") or ""
-        
-        # Quality preset
-        quality = (self.settings.get("mpv_quality") or "auto").strip()
-        
-        # Optional cookies for playback
-        cookies_enabled = self.settings.get("mpv_cookies_enable")
-        cookies_browser = self.settings.get("mpv_cookies_browser")
-        cookies_keyring = self.settings.get("mpv_cookies_keyring")
-        cookies_profile = self.settings.get("mpv_cookies_profile")
-        cookies_container = self.settings.get("mpv_cookies_container")
-        
-        http_proxy = (self.settings.get("http_proxy") or "").strip()
-        fullscreen = bool(self.settings.get("mpv_fullscreen"))
-
-        # SponsorBlock settings
-        sb_enabled = bool(self.settings.get("sb_playback_enable"))
-        sb_mode = (self.settings.get("sb_playback_mode") or "mark").strip()
-        sb_categories = (self.settings.get("sb_playback_categories") or "default").strip()
-
         # Play using the playback service
-        success = self.playback_service.play(
-            video=video,
-            playback_mode=mode,
-            mpv_args=mpv_args,
-            quality=quality,
-            cookies_enabled=cookies_enabled,
-            cookies_browser=cookies_browser or "",
-            cookies_keyring=cookies_keyring or "",
-            cookies_profile=cookies_profile or "",
-            cookies_container=cookies_container or "",
-            http_proxy=http_proxy or None,
-            fullscreen=fullscreen,
-            sb_enabled=sb_enabled,
-            sb_mode=sb_mode,
-            sb_categories=sb_categories,
-        )
+        success = self.playback_service.play(video=video)
         
+        mode = self.settings.get("playback_mode", "external")
         if success and mode == "embedded":
             # If embedded playback was successful, show the player view
             self.navigation_controller.show_view("player")
