@@ -33,6 +33,10 @@ def xdg_data_dir() -> Path:
 def settings_path() -> Path:
     return xdg_config_dir() / "settings.json"
 
+def _download_archive_path() -> Path:
+    """Return the path to the yt-dlp download archive file."""
+    return xdg_data_dir() / "download_archive.txt"
+
 def load_settings() -> dict[str, Any]:
     p = settings_path()
     if p.exists():

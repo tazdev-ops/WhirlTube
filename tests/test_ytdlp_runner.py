@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import json
-from src.whirltube.ytdlp_runner import parse_line, ProgressEvent, PREFIX
+from src.whirltube.ytdlp_runner import parse_line, PREFIX
 
 def test_parse_line_valid_json():
     json_data = {"type": "downloading", "progress": 0.5}

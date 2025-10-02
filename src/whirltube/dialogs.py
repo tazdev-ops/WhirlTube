@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
+from typing import Any, Callable
 
 import gi
-
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, Gtk
 
-import logging
+from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
+
 log = logging.getLogger(__name__)
 
 
@@ -132,11 +134,17 @@ class DownloadOptions:
             c = self.cookies_browser.strip()
             if self.cookies_keyring.strip():
                 c += f"+{self.cookies_keyring.strip()}"
-            if self.cookies_profile.strip() or self.cookies_container.strip():
-                prof = self.cookies_profile.strip()
-                cont = self.cookies_container.strip()
+            prof = self.cookies_profile.strip()
+            cont = self.cookies_container.strip()
+            
+            # Handle profile and container correctly
+            if prof and cont:
+                c += f":{prof}::{cont}"
+            elif prof:
                 c += f":{prof}"
-                c += f"::{cont}" if cont else ""
+            elif cont:
+                c += f"::{cont}"
+            
             parts += ["--cookies-from-browser", c]
 
         # network
@@ -425,15 +433,22 @@ class DownloadOptionsWindow(Adw.Window):
             selected_str: str | None = None
             try:
                 if isinstance(model, Gtk.StringList):
-                    # Gtk.StringList.get_string is the robust way to get the string
                     selected_str = model.get_string(format_idx)
             except Exception:
                 selected_str = None
-            if selected_str:
-                format_id = self._format_map.get(selected_str)
+            
+            if selected_str and selected_str in self._format_map:
+                format_id = self._format_map[selected_str]
+            elif selected_str and selected_str != "Select a format...":
+                # Format was selected but not in map - log warning
+                log.warning(f"Selected format '{selected_str}' not found in format map")
         
         # Get custom format or selected format
-        custom_format = self.custom_format_row.get_text().strip() if self.custom_format_row.get_visible() else None
+        custom_format = None
+        if self.custom_format_row.get_visible():
+            custom_format = self.custom_format_row.get_text().strip()
+        
+        # Priority: custom_format from visible row > format_id from dropdown > None
         if not custom_format and format_id:
             custom_format = str(format_id)
         # If a specific format was chosen from the list, treat it as "Custom" quality
@@ -610,6 +625,24 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_invidious.set_text(settings.get("invidious_instance", "https://yewtu.be"))
         group_provider.add(self.entry_invidious)
 
+        # Invidious Account (authentication)
+        group_account = Adw.PreferencesGroup(title="Invidious Account (Optional)")
+        page_provider.add(group_account)
+        
+        self.btn_inv_connect = Adw.ActionRow(title="Connect Account")
+        connect_btn = Gtk.Button(label="Authorize")
+        connect_btn.connect("clicked", self._on_inv_authorize)
+        self.btn_inv_connect.add_suffix(connect_btn)
+        group_account.add(self.btn_inv_connect)
+        
+        # Status label
+        self.lbl_inv_status = Gtk.Label(label="Not connected")
+        self.lbl_inv_status.set_halign(Gtk.Align.END)
+        self.btn_inv_connect.add_suffix(self.lbl_inv_status)
+        
+        # Test token on load
+        self._test_inv_token()
+
         # Downloads page
         page_dl = Adw.PreferencesPage(title="Downloads")
         group_dl = Adw.PreferencesGroup(title="Location")
@@ -634,6 +667,39 @@ class PreferencesWindow(Adw.PreferencesWindow):
         self.entry_template.set_text(settings.get("download_template", "%(title)s.%(ext)s"))
         self.entry_template.set_tooltip_text("yt-dlp template, e.g. %(title)s.%(ext)s or %(uploader)s/%(title)s.%(ext)s")
         group_dl.add(self.entry_template)
+
+        # NEW: Quick quality presets
+        self.entry_quick_presets = Adw.EntryRow(title="Quick download buttons")
+        self.entry_quick_presets.set_text(settings.get("quick_quality_presets", "1080p,720p,audio"))
+        self.entry_quick_presets.set_tooltip_text("Comma-separated: 2160p,1440p,1080p,720p,480p,audio")
+        group_dl.add(self.entry_quick_presets)
+
+        # NEW: SponsorBlock page
+        page_sb = Adw.PreferencesPage(title="SponsorBlock")
+        group_sb_cats = Adw.PreferencesGroup(title="Skipped categories")
+        page_sb.add(group_sb_cats)
+
+        # SponsorBlock category toggles
+        self.sb_cat_checks: dict[str, Gtk.CheckButton] = {}
+        current_cats = (settings.get("sb_skip_categories") or "sponsor").split(",")
+        # from https://wiki.sponsor.ajay.app/w/Categories
+        for cat_id, cat_name in [
+            ("sponsor", "Sponsor"),
+            ("selfpromo", "Self-promotion"),
+            ("interaction", "Interaction reminder"),
+            ("intro", "Intro"),
+            ("outro", "Outro"),
+            ("preview", "Preview/Recap"),
+            ("music_offtopic", "Music/Off-topic"),
+            ("poi_highlight", "Highlight"),
+        ]:
+            row = Adw.SwitchRow(title=cat_name)
+            row.set_active(cat_id in current_cats)
+            group_sb_cats.add(row)
+            self.sb_cat_checks[cat_id] = row
+        
+        # Add page
+        self.add(page_sb)
 
         # Network (global)
         group_net = Adw.PreferencesGroup(title="Network")
@@ -707,4 +773,98 @@ class PreferencesWindow(Adw.PreferencesWindow):
         # After completion + template
         self.settings["download_auto_open_folder"] = bool(self.sw_auto_open.get_active())
         self.settings["download_template"] = self.entry_template.get_text().strip() or "%(title)s.%(ext)s"
+        self.settings["quick_quality_presets"] = self.entry_quick_presets.get_text().strip() or "1080p,720p,audio"
+        
+        # NEW: Invidious Auth Token
+        # Save to secure storage if available
+        token = getattr(self, "_invidious_token", "")
+        if token:
+            try:
+                from .invidious_auth import InvidiousAuth
+                # Try to use secure storage
+                auth = InvidiousAuth("")
+                if auth._set_secure_token(token):
+                    # Successfully saved to secure storage, clear from plain text settings
+                    self.settings["invidious_token"] = ""
+                else:
+                    # Fall back to plain text storage
+                    self.settings["invidious_token"] = token
+            except Exception:
+                # Fall back to plain text storage
+                self.settings["invidious_token"] = token
+        else:
+            # Clear token
+            try:
+                from .invidious_auth import InvidiousAuth
+                auth = InvidiousAuth("")
+                auth._delete_secure_token()
+            except Exception:
+                pass
+            self.settings["invidious_token"] = ""
+        
+        # NEW: SponsorBlock settings
+        
+        # Save selected categories
+        selected_cats = []
+        for cat_id, check in self.sb_cat_checks.items():
+            if check.get_active():
+                selected_cats.append(cat_id)
+        self.settings["sb_skip_categories"] = ",".join(selected_cats)
+        
         return False
+
+    def _test_inv_token(self) -> None:
+        """Test if there's a valid token and update UI status"""
+        # Try to get token from secure storage first
+        try:
+            from .invidious_auth import InvidiousAuth
+            auth = InvidiousAuth("")
+            token = auth._get_secure_token()
+            
+            if not token:
+                # Fall back to plain text settings
+                token = self.settings.get("invidious_token", "")
+            
+            if token:
+                self.lbl_inv_status.set_text("✓ Connected")
+                self._invidious_token = token
+            else:
+                self.lbl_inv_status.set_text("Not connected")
+        except Exception:
+            # Fall back to plain text settings
+            token = self.settings.get("invidious_token", "")
+            if token:
+                self.lbl_inv_status.set_text("✓ Connected")
+                self._invidious_token = token
+            else:
+                self.lbl_inv_status.set_text("Not connected")
+
+    def _on_inv_authorize(self, _btn) -> None:
+        """Handle Invidious authorization button click"""
+        try:
+            from .invidious_auth import InvidiousAuth, is_valid_invidious_instance
+            
+            instance_url = self.entry_invidious.get_text().strip()
+            if not instance_url:
+                self.lbl_inv_status.set_text("✗ Please enter an instance URL")
+                return
+            
+            if not is_valid_invidious_instance(instance_url):
+                self.lbl_inv_status.set_text("✗ Invalid Invidious instance")
+                return
+            
+            # Create auth instance and request token
+            auth = InvidiousAuth(instance_url)
+            scopes = [":feed", "GET:subscriptions", "POST:subscriptions*", "DELETE:subscriptions*"]
+            
+            token = auth.request_token(scopes)
+            if token:
+                self._invidious_token = token
+                self.lbl_inv_status.set_text("✓ Connected")
+                # Will save in _on_close when settings are saved
+            else:
+                self.lbl_inv_status.set_text("✗ Authorization failed")
+        except Exception as e:
+            import logging
+            logging.exception("Invidious auth failed")
+            self.lbl_inv_status.set_text(f"✗ Error: {str(e)[:30]}")

@@ -1,0 +1,18 @@
+    def _download_video_with_options(self, video: Video, opts: DownloadOptions) -> None:
+        self.download_manager.start_download(video, opts)
+
+    def _show_downloads(self, *_args) -> None:
+        self.navigation_controller.show_view("downloads")
+
+    def _open_download_dir(self, *_a) -> None:
+        try:
+            p = self.download_dir
+            if isinstance(p, Path):
+                Gio.AppInfo.launch_default_for_uri(p.as_uri(), None)
+        except Exception:
+            pass
+
+def _spacer(px: int) -> Gtk.Box:
+    b = Gtk.Box()
+    b.set_size_request(-1, px)
+    return b

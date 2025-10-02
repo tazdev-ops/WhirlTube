@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import logging
-import json
+import os
+import threading
+import time
 from pathlib import Path
-from collections.abc import Callable
-from typing import Any
-from functools import partial
+from typing import Any, Callable
 from copy import deepcopy
+from functools import partial
 from dataclasses import asdict
+import json
 
 import gi
-
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
@@ -20,7 +21,7 @@ from .downloader import DownloadProgress, DownloadTask, RunnerDownloadTask
 from .models import Video
 from .dialogs import DownloadOptions
 from .download_history import add_download
-from .util import xdg_data_dir
+from .util import xdg_data_dir, _download_archive_path
 
 log = logging.getLogger(__name__)
 
@@ -360,22 +361,36 @@ class DownloadManager:
         # Start as many as allowed
         while self._active < self._max_concurrent and self._queue:
             video, opts, dest_dir, row = self._queue.pop(0)
+            # Persist immediately after queue modification, before task start
             self._persist_queue()
-            self._start_task(video, opts, dest_dir, row)
+            try:
+                self._start_task(video, opts, dest_dir, row)
+            except Exception as e:
+                # If task fails to start, decrement active count
+                self._active = max(0, self._active - 1)
+                # Mark row as error
+                try:
+                    row.update_progress(DownloadProgress(status="error", error=f"Failed to start: {e}"))
+                except Exception:
+                    pass
 
     def _cancel_row(self, row: DownloadRow | None) -> None:
         # If None passed (shouldn't happen), ignore
         if row is None:
             return
         # If queued: remove from queue
+        removed = False
         for i, (_v, _o, _d, r) in enumerate(list(self._queue)):
             if r is row:
                 try:
                     self._queue.pop(i)
+                    removed = True
                 except Exception:
                     pass
+                # Persist after successful removal
+                if removed:
+                    self._persist_queue()
                 row.mark_cancelled()
-                self._persist_queue()
                 return
         # If running: try to stop the task
         task = getattr(row, "task", None)
@@ -462,6 +477,30 @@ class DownloadManager:
                 except Exception:
                     pass
 
+    def _validate_template(self, template: str) -> str:
+        """Validate and sanitize output template"""
+        if not template or not template.strip():
+            return "%(title)s.%(ext)s"
+        
+        template = template.strip()
+        
+        # Check for path traversal attempts
+        if ".." in template:
+            log.warning(f"Template contains '..', using default: {template}")
+            return "%(title)s.%(ext)s"
+        
+        # Check for absolute paths (Unix / and Windows C:\ style)
+        if template.startswith("/") or (len(template) > 1 and template[1:3] == ":\\"):
+            log.warning(f"Template contains absolute path, using default: {template}")
+            return "%(title)s.%(ext)s"
+        
+        # Basic check: should contain %(ext)s for proper extension
+        if "%(ext)s" not in template:
+            log.warning(f"Template missing %(ext)s, appending it: {template}")
+            template = f"{template}.%(ext)s"
+        
+        return template
+
     def _start_task(self, video: Video, opts: DownloadOptions, dest_dir: Path, row: DownloadRow) -> None:
         self._active += 1
         advanced = (
@@ -510,6 +549,11 @@ class DownloadManager:
             cli = opts.raw_cli_list()
             # Add collision handling: let yt-dlp auto-rename if file exists
             cli.append("--no-overwrites")
+            
+            # Add archive to prevent re-downloads
+            archive_path = _download_archive_path()
+            cli.extend(["--download-archive", str(archive_path)])
+            
             # Inject global proxy if configured and not set explicitly
             proxy = self.get_setting("http_proxy")
             if isinstance(proxy, str) and proxy.strip() and "--proxy" not in cli:
@@ -518,7 +562,7 @@ class DownloadManager:
             ytdlp_path = self.get_setting("ytdlp_path")
             if not isinstance(ytdlp_path, str) or not ytdlp_path.strip():
                 ytdlp_path = None
-            template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
+            template = self._validate_template(str(self.get_setting("download_template") or "%(title)s.%(ext)s"))
             task = RunnerDownloadTask(video, dest_dir, cli, bin_path=ytdlp_path, outtmpl_template=template)
             row.attach_task(task)
             # Update cancel binding to running task
@@ -531,7 +575,11 @@ class DownloadManager:
         if isinstance(proxy, str) and proxy.strip():
             ydl_override["proxy"] = proxy.strip()
 
-        template = str(self.get_setting("download_template") or "%(title)s.%(ext)s")
+        # Add archive support
+        archive_path = _download_archive_path()
+        ydl_override["download_archive"] = str(archive_path)
+        
+        template = self._validate_template(str(self.get_setting("download_template") or "%(title)s.%(ext)s"))
         dl_task = DownloadTask(video=video, dest_dir=dest_dir, ydl_opts_override=ydl_override)
         dl_task.set_outtmpl_template(template)
         row.attach_task(dl_task)

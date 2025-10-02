@@ -9,13 +9,16 @@ APP_ID = "org.whirltube.WhirlTube"
 log = logging.getLogger(__name__)
 
 
-def _setup_logging() -> None:
-    level = logging.DEBUG if os.environ.get("WHIRLTUBE_DEBUG") else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-
 def main(argv: list[str] | None = None) -> int:
-    _setup_logging()
+    # Set locale for libmpv requirements (client.h)
+    try:
+        import locale
+        locale.setlocale(locale.LC_NUMERIC, "C")
+    except Exception:
+        pass
+    
+    from .logging_config import setup_logging
+    setup_logging(debug=bool(os.environ.get("WHIRLTUBE_DEBUG")))
     # Lazy import GTK libs so importing this module doesn't require GI
     import gi
     gi.require_version("Gtk", "4.0")

@@ -12,6 +12,8 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 from .util import load_settings, save_settings, _download_archive_path  # noqa: E402
 from .ytdlp_runner import YtDlpRunner, parse_line  # noqa: E402
 
+import threading
+
 
 def _notify(summary: str) -> None:
     try:
@@ -138,6 +140,14 @@ class QuickDownloadWindow(Gtk.Window):
         yrow.append(btn_y)
         sbox.append(yrow)
 
+        # Concurrency control (Task 10)
+        con_row = Gtk.Box(spacing=6)
+        con_row.append(Gtk.Label(label="Concurrent fragments (-N):", xalign=0))
+        self.spin_concurrency = Gtk.SpinButton.new_with_range(1, 16, 1)
+        self.spin_concurrency.set_value(float(self.settings.get("quick_concurrency", 4)))
+        con_row.append(self.spin_concurrency)
+        sbox.append(con_row)
+
         page_settings = self.tabview.append(sbox)
         page_settings.set_title("Settings")
 
@@ -231,6 +241,8 @@ class QuickDownloadWindow(Gtk.Window):
         self.settings["ytdlp_path"] = self.entry_ytdlp.get_text().strip()
         # also persist cookies path for convenience
         self.settings["quick_cookies_path"] = self.entry_cookies.get_text().strip()
+        # persist concurrency setting (Task 10)
+        self.settings["quick_concurrency"] = int(self.spin_concurrency.get_value())
         save_settings(self.settings)
 
         args: list[str] = []
@@ -266,7 +278,7 @@ class QuickDownloadWindow(Gtk.Window):
 
         # sponsorblock (Task 5)
         sb_idx = self.dd_sb.get_selected()
-        cats = self.settings.get("sb_playback_categories", "default")
+        cats = self.settings.get("sb_skip_categories", "default")
         if sb_idx == 1:
             args += ["--sponsorblock-mark", cats]
         elif sb_idx == 2:
@@ -287,13 +299,14 @@ class QuickDownloadWindow(Gtk.Window):
             ]
 
         # Parity arguments (Task 2)
+        concurrency = str(int(self.spin_concurrency.get_value()))
         args += [
             "--download-archive", str(_download_archive_path()),
             "--no-overwrites",
             "--continue",
             "--retries", "3",
             "--fragment-retries", "2",
-            "-N", "4", # Concurrency
+            "-N", concurrency, # Concurrency (Task 10)
         ]
 
         args += urls
@@ -303,7 +316,6 @@ class QuickDownloadWindow(Gtk.Window):
         path = self.settings.get("ytdlp_path", "") or None
         self.runner.start(args, bin_path=path)
         # Watch for process exit, then mark end if not already stopped
-        import threading
         def _watch():
             import time
             while self.runner.is_running():

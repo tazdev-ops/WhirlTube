@@ -12,7 +12,6 @@ from ...util import save_settings
 
 if TYPE_CHECKING:
     from ...providers.base import Provider
-    from ...navigation_controller import NavigationController
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +40,15 @@ def run_search(
     limit: int,
     last_filters: dict[str, str] | None,
     timed_func: callable,
+    search_lock: threading.Lock | None = None,  # NEW PARAMETER
 ) -> None:
     """Execute the search query in a worker thread."""
     log.info("Searching: %s", query)
     show_loading_func(f"Searching: {query}", cancellable=True)
 
-    gen = set_search_generation_func(search_generation + 1)
+    with (search_lock if search_lock else threading.Lock()):
+        gen = set_search_generation_func(search_generation + 1)
+        current_gen = gen
 
     def worker() -> None:
         with timed_func(f"Search: {query}"):
@@ -64,8 +66,18 @@ def run_search(
                 log.exception("Search failed")
                 GLib.idle_add(show_error_func, f"Search failed: {e}")
                 return
-        if gen != settings.get("_search_generation", 0): # Use settings to check generation
-            return
+        
+        # Check if still the current search with lock
+        if search_lock:
+            with search_lock:
+                if current_gen != settings.get("_search_generation", 0):
+                    log.debug(f"Search '{query}' cancelled (generation mismatch: {current_gen} != {settings.get('_search_generation')})")
+                    return
+        else:
+            if current_gen != settings.get("_search_generation", 0):
+                log.debug(f"Search '{query}' cancelled (generation mismatch: {current_gen} != {settings.get('_search_generation')})")
+                return
+        
         GLib.idle_add(populate_results_func, results)
 
     threading.Thread(target=worker, daemon=True).start()

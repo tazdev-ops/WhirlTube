@@ -1,56 +1,59 @@
 from __future__ import annotations
-from .base import Provider
-from .ytdlp import YTDLPProvider
-from .innertube_web import InnerTubeWeb
-from ..models import Video
-import re
-import urllib.parse
 
-def _extract_id(url: str) -> str | None:
-    try:
-        u = urllib.parse.urlparse(url)
-        host = (u.hostname or "").lower()
-        if host == "youtu.be":
-            m = re.match(r"^/([0-9A-Za-z_-]{11})", u.path or "")
-            return m.group(1) if m else None
-        if host.endswith("youtube.com"):
-            if (u.path or "").startswith("/watch"):
-                q = urllib.parse.parse_qs(u.query or "")
-                v = q.get("v", [None])[0]
-                if v and re.fullmatch(r"[0-9A-Za-z_-]{11}", v):
-                    return v
-            m = re.match(r"^/(?:shorts|embed)/([0-9A-Za-z_-]{11})", u.path or "")
-            return m.group(1) if m else None
-    except Exception:
-        return None
-    return None
+import logging
+
+from ..models import Video, Format
+from .base import Provider
+from .innertube_web import InnerTubeWeb
+from .ytdlp import YTDLPProvider
+
+log = logging.getLogger(__name__)
 
 class HybridProvider(Provider):
-    def __init__(self, web: InnerTubeWeb, fallback: YTDLPProvider):
-        self._web = web
-        self._fb = fallback
+    """
+    A provider that intelligently delegates calls to a fast provider (InnerTubeWeb)
+    for lightweight tasks (suggestions, trending) and a robust provider (YTDLPProvider)
+    for heavy tasks (search, formats, comments).
+    """
+    def __init__(self, fast_provider: InnerTubeWeb, robust_provider: YTDLPProvider) -> None:
+        self._fast = fast_provider
+        self._robust = robust_provider
 
-    # Keep yt-dlp paths for everything else
-    def search(self, *a, **k): return self._fb.search(*a, **k)
-    def browse_url(self, *a, **k): return self._fb.browse_url(*a, **k)
-    def playlist(self, *a, **k): return self._fb.playlist(*a, **k)
-    def related(self, *a, **k): return self._fb.related(*a, **k)
-    def fetch_formats(self, *a, **k): return self._fb.fetch_formats(*a, **k)
-    def channel_url_of(self, *a, **k): return self._fb.channel_url_of(*a, **k)
+    # --- Fast Path (InnerTubeWeb) ---
+
+    def suggestions(self, query: str, max_items: int = 10) -> list[str]:
+        return self._fast.suggestions(query, max_items)
 
     def trending(self) -> list[Video]:
-        try:
-            vids = self._web.trending()
-            return vids or self._fb.trending()
-        except Exception:
-            return self._fb.trending()
+        # InnerTubeWeb delegates to its fallback (which is YTDLPProvider)
+        # so calling _fast.trending() is sufficient.
+        return self._fast.trending()
 
-    def comments(self, video_url: str, max_comments: int = 100) -> list[Video]:
-        vid = _extract_id(video_url)
-        if not vid:
-            return []
-        try:
-            out = self._web.comments(vid, limit=max_comments)
-            return out or self._fb.comments(video_url, max_comments=max_comments)
-        except Exception:
-            return self._fb.comments(video_url, max_comments=max_comments)
+    # --- Robust Path (YTDLPProvider) ---
+
+    def search(self, query: str, limit: int, filters: dict[str, str] | None = None) -> list[Video]:
+        # YTDLPProvider handles search with filters
+        return self._robust.search(query, limit, filters)
+
+    def related(self, video_id: str) -> list[Video]:
+        return self._robust.related(video_id)
+
+    def comments(self, video_id: str) -> list[Video]:
+        return self._robust.comments(video_id)
+
+    def channel_tab(self, channel_url: str, tab: str) -> list[Video]:
+        return self._robust.channel_tab(channel_url, tab)
+
+    def fetch_formats(self, url: str) -> list[Format]:
+        return self._robust.fetch_formats(url)
+
+    def get_video_info(self, url: str) -> Video | None:
+        # This is a robust operation, delegate to ytdlp
+        return self._robust.get_video_info(url)
+
+    def set_cookies_from_browser(self, spec: str) -> None:
+        # Cookies are primarily for yt-dlp to access region-locked content
+        self._robust.set_cookies_from_browser(spec)
+
+    def get_proxy(self) -> str | None:
+        return self._robust.get_proxy()

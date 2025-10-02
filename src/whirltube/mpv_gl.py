@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import logging
 import locale
 from typing import Optional, Mapping, Any
+
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib

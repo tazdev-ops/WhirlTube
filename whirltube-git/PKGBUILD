@@ -1,5 +1,5 @@
 pkgname=whirltube-git
-pkgver=0.0.0
+pkgver=0.4.7.0.gf8716d9
 pkgrel=1
 pkgdesc="Lightweight GTK4 frontend for YouTube using mpv and yt-dlp (git)"
 arch=('any')

@@ -129,13 +129,31 @@ def on_related(video: Video, provider: Provider, navigation_controller: Navigati
 def on_comments(video: Video, provider: Provider, navigation_controller: NavigationController, 
                show_error, populate_results, show_loading_cb) -> None:
     """Show comments for a given video"""
+    show_loading_cb(f"Comments for: {video.title}")
 
-
+    # Use Event for proper thread coordination
+    completed = threading.Event()
+    
+    def watchdog():
+        # Wait for 20 seconds or until completed
+        if not completed.wait(timeout=20.0):
+            # Timeout occurred, worker hasn't completed
+            GLib.idle_add(show_error, "Comments timed out (YouTube may be rate-limiting)")
+    
     def worker():
-        show_loading_cb("Fetching comments...")
-        vids = provider.comments(video.url, max_comments=100)
-        GLib.idle_add(populate_results, vids)
-
+        try:
+            vids = provider.comments(video.url, max_comments=100)
+        except Exception as e:
+            if not completed.is_set():
+                completed.set()
+                GLib.idle_add(show_error, f"Comments failed: {e}")
+            return
+        
+        if not completed.is_set():
+            completed.set()
+            GLib.idle_add(populate_results, vids)
+    
+    threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
 
 

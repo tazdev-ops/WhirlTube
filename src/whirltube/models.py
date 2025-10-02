@@ -4,6 +4,14 @@ from dataclasses import dataclass
 
 
 @dataclass(slots=True)
+class Format:
+    format_id: str
+    label: str
+    url: str | None = None
+    filesize: int | None = None
+
+
+@dataclass(slots=True)
 class Video:
     id: str
     title: str

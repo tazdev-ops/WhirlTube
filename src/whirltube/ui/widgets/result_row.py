@@ -1,20 +1,45 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-import httpx
-from typing import Any
+from typing import Callable
 
-from ...models import Video
-from ...metrics import timed
-from ...util import safe_httpx_proxy, is_valid_youtube_url
-HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+import httpx
 
 import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
+from ...models import Video
+from ...dialogs import DownloadOptions
+from ...thumbnail_cache import get_cached_thumbnail, cache_thumbnail
+from ...util import safe_httpx_proxy, is_valid_youtube_url
+from ...subscription_feed import is_watched, mark_as_watched, mark_as_unwatched
+from ...watch_later import is_in_watch_later, add_to_watch_later, remove_from_watch_later
+from ...quick_quality import get_enabled_presets, get_preset_label, get_preset_tooltip, get_quick_quality_options
+from ...metrics import timed
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+
 log = logging.getLogger(__name__)
+
+# Shared HTTP client for thumbnail loading to reuse connections
+_http_client: httpx.Client | None = None
+
+def _get_http_client(proxy: str | None) -> httpx.Client:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.Client(
+            timeout=10.0,
+            follow_redirects=True,
+            headers=HEADERS,
+            proxy=safe_httpx_proxy(proxy),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5)
+        )
+    return _http_client
 
 
 class ResultRow(Gtk.Box):
@@ -33,6 +58,8 @@ class ResultRow(Gtk.Box):
         followed: bool = False,
         on_open_channel: Callable[[Video], None] | None = None,
         on_toast: Callable[[str], None] | None = None,
+        get_setting: Callable[[str], any] | None = None,  # NEW parameter
+        on_quick_download: Callable[[Video, DownloadOptions], None] | None = None,  # NEW parameter
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.video = video
@@ -48,43 +75,66 @@ class ResultRow(Gtk.Box):
         self._followed = followed
         self._http_proxy = http_proxy
         self.on_toast = on_toast
+        self._get_setting = get_setting or (lambda k: None)  # NEW
+        self._on_quick_download = on_quick_download  # NEW
         self._proxies = safe_httpx_proxy(http_proxy)
+        self._thumb_future = None  # Track thumbnail loading future to prevent memory leaks
 
         self.set_margin_top(6)
         self.set_margin_bottom(6)
 
         # Thumbnail stack with placeholder and image
-        self.thumb_stack = Gtk.Stack()
-        self.thumb_stack.set_size_request(160, 90)
-        
-        # Create placeholder widget once
-        self.thumb_placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.thumb_placeholder.set_size_request(160, 90)
-        self.thumb_placeholder.set_halign(Gtk.Align.FILL)
-        self.thumb_placeholder.set_valign(Gtk.Align.FILL)
-        lbl = Gtk.Label(label="No thumbnail")
-        lbl.set_halign(Gtk.Align.CENTER)
-        lbl.set_valign(Gtk.Align.CENTER)
-        lbl.add_css_class("dim-label")
-        lbl.set_wrap(True)
-        self.thumb_placeholder.append(lbl)
-        
-        # Create picture widget once
-        self.thumb = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
-        self.thumb.set_size_request(160, 90)
-        
-        # Add both to stack
-        self.thumb_stack.add_named(self.thumb_placeholder, "placeholder")
-        self.thumb_stack.add_named(self.thumb, "picture")
-        self.append(self.thumb_stack)
+        self._has_thumb = self.video.kind != "comment"
+        if self._has_thumb:
+            self.thumb_stack = Gtk.Stack()
+            self.thumb_stack.set_size_request(160, 90)
+            
+            # Create placeholder widget once
+            self.thumb_placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.thumb_placeholder.set_size_request(160, 90)
+            self.thumb_placeholder.set_halign(Gtk.Align.FILL)
+            self.thumb_placeholder.set_valign(Gtk.Align.FILL)
+            lbl = Gtk.Label(label="No thumbnail")
+            lbl.set_halign(Gtk.Align.CENTER)
+            lbl.set_valign(Gtk.Align.CENTER)
+            lbl.add_css_class("dim-label")
+            lbl.set_wrap(True)
+            self.thumb_placeholder.append(lbl)
+            
+            # Create picture widget once
+            self.thumb = Gtk.Picture(content_fit=Gtk.ContentFit.COVER)
+            self.thumb.set_size_request(160, 90)
+            
+            # Add both to stack
+            self.thumb_stack.add_named(self.thumb_placeholder, "placeholder")
+            self.thumb_stack.add_named(self.thumb, "picture")
+            self.append(self.thumb_stack)
+        else:
+            # Add a small spacer for alignment if no thumbnail
+            spacer = Gtk.Box()
+            spacer.set_size_request(16, 1) # Small spacer
+            self.append(spacer)
 
         # Texts
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        title = Gtk.Label(label=video.title, wrap=True, xalign=0.0)
+
+        # Title with watched indicator
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title = Gtk.Label(label=video.title, wrap=True, xalign=0.0, hexpand=True)
         title.add_css_class("title-3")
+        title_box.append(title)
+
+        # NEW: Watched indicator
+        if video.is_playable and is_watched(video.id):
+            watched_label = Gtk.Label(label="✓ Watched")
+            watched_label.add_css_class("dim-label")
+            watched_label.set_tooltip_text("You've watched this video")
+            title_box.append(watched_label)
+
+        box.append(title_box)
+
         meta = Gtk.Label(label=_fmt_meta(video), xalign=0.0)
         meta.add_css_class("dim-label")
-        box.append(title)
         box.append(meta)
         self.append(box)
 
@@ -93,14 +143,52 @@ class ResultRow(Gtk.Box):
         if video.is_playable:
             play_btn = Gtk.Button(label="Play")
             play_btn.connect("clicked", self._on_play_clicked)
-            dl_btn = Gtk.Button(label="Download…")
-            dl_btn.connect("clicked", self._on_download_clicked)
             btn_box.append(play_btn)
-            btn_box.append(dl_btn)
+            
+            # NEW: Quick quality download buttons in a horizontal box
+            quick_dl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            quick_dl_box.set_homogeneous(True)
+            
+            # Get enabled presets from settings
+            enabled_presets = get_enabled_presets(
+                self._get_setting("quick_quality_presets") if self._get_setting else None
+            )
+            
+            for preset_key in enabled_presets:
+                preset_btn = Gtk.Button(label=get_preset_label(preset_key))
+                preset_btn.set_tooltip_text(get_preset_tooltip(preset_key))
+                preset_btn.add_css_class("flat")
+                preset_btn.connect("clicked", self._on_quick_download, preset_key)
+                quick_dl_box.append(preset_btn)
+            
+            btn_box.append(quick_dl_box)
+            
+            # Original download options button (now labeled "More...")
+            dl_opts_btn = Gtk.Button(label="⚙ More…")
+            dl_opts_btn.set_tooltip_text("Advanced download options")
+            dl_opts_btn.connect("clicked", self._on_download_clicked)
+            btn_box.append(dl_opts_btn)
+            
+            # NEW: Watch Later button
+            self._in_watch_later = is_in_watch_later(video.id)
+            self.wl_btn = Gtk.Button()
+            self._update_wl_button_label()
+            self.wl_btn.connect("clicked", self._on_watch_later_clicked)
+            btn_box.append(self.wl_btn)
+            
             # Compact "More…" menu
             more = Gtk.MenuButton(label="More…")
             pop = Gtk.Popover()
             vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            
+            # NEW: Toggle watched status
+            watched = is_watched(self.video.id)
+            b_watch = Gtk.Button(label="Mark as Unwatched" if watched else "Mark as Watched")
+            b_watch.connect("clicked", self._on_toggle_watched)
+            vbx.append(b_watch)
+            
+            # NEW: SponsorBlock boundary marker
+            
             b_rel = Gtk.Button(label="Related")
             b_rel.connect("clicked", lambda *_: self.on_related(self.video))
             b_cmt = Gtk.Button(label="Comments")
@@ -178,11 +266,12 @@ class ResultRow(Gtk.Box):
         self.append(btn_box)
 
         # Load thumbnail
-        if video.thumb_url:
-            self.thumb_loader_pool.submit(self._load_thumb)
-        else:
-            # No URL -> placeholder
-            GLib.idle_add(self._set_thumb_placeholder)
+        if self._has_thumb:
+            if video.thumb_url:
+                self._thumb_future = self.thumb_loader_pool.submit(self._load_thumb)
+            else:
+                # No URL -> placeholder
+                GLib.idle_add(self._set_thumb_placeholder)
 
     def _on_play_clicked(self, *_a):
         import logging
@@ -205,33 +294,64 @@ class ResultRow(Gtk.Box):
 
     def _load_thumb(self) -> None:
         with timed(f"Thumbnail load: {self.video.title[:30]}"):
-            # Try with proxy (if valid), then fallback without
+            # Check cancellation early
+            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                return
+            
+            # Check cache first
+            cached_path = get_cached_thumbnail(self.video.thumb_url)
+            if cached_path:
+                try:
+                    data = cached_path.read_bytes()
+                    # Check cancellation before updating UI
+                    if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                        return
+                    GLib.idle_add(self._set_thumb, data)
+                    return
+                except Exception as e:
+                    log.debug(f"Failed to read cached thumbnail: {e}")
+                    # Fall through to download
+            
+            # Try download with shared client
             data: bytes | None = None
             try:
-                # For httpx 0.28.1+, use proxy parameter directly when _proxies is a string
-                if self._proxies:
-                    with httpx.Client(timeout=10.0, follow_redirects=True, proxy=self._proxies, headers=HEADERS) as client:
-                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r.raise_for_status()
-                        data = r.content
-                else:
-                    # No proxy configured
-                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client:
-                        r = client.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r.raise_for_status()
-                        data = r.content
+                # For httpx 0.28.1+, use proxy parameter directly
+                client = _get_http_client(self._http_proxy)
+                r = client.get(self.video.thumb_url)
+                r.raise_for_status()
+                data = r.content
             except Exception:
                 data = None
                 # Fallback: retry without proxy if we had one
                 try:
-                    with httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS) as client2:
-                        r2 = client2.get(self.video.thumb_url)  # type: ignore[arg-type]
-                        r2.raise_for_status()
-                        data = r2.content
+                    # Create temporary client without proxy
+                    temp_client = httpx.Client(timeout=10.0, follow_redirects=True, headers=HEADERS)
+                    r2 = temp_client.get(self.video.thumb_url)
+                    r2.raise_for_status()
+                    data = r2.content
+                    temp_client.close()
                 except Exception:
                     data = None
+            
             if data is None:
+                # Check cancellation before updating UI
+                if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                    return
                 GLib.idle_add(self._set_thumb_placeholder)
+                return
+            
+            # Check cancellation before caching
+            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
+                return
+            
+            # Cache the downloaded thumbnail
+            try:
+                cache_thumbnail(self.video.thumb_url, data)
+            except Exception as e:
+                log.debug(f"Failed to cache thumbnail: {e}")
+            
+            # Check cancellation before updating UI
+            if not hasattr(self, '_thumb_future') or (hasattr(self._thumb_future, 'done') and self._thumb_future.done()):
                 return
             GLib.idle_add(self._set_thumb, data)
 
@@ -334,7 +454,7 @@ class ResultRow(Gtk.Box):
                 
                 if self.on_toast:
                     self.on_toast(toast_msg)
-            except Exception as e:
+            except Exception:
                 # Fallback: try the primary clipboard (X11 middle-click selection)
                 try:
                     if disp:
@@ -348,11 +468,112 @@ class ResultRow(Gtk.Box):
         
         GLib.idle_add(copy_on_main)
 
+    def cancel_thumbnail_loading(self) -> None:
+        """
+        Cancel pending thumbnail loading if still in progress.
+        This helps prevent memory leaks when rows are scrolled away.
+        """
+        if self._thumb_future and not self._thumb_future.done():
+            self._thumb_future.cancel()
+            self._thumb_future = None
+
+    def _update_wl_button_label(self) -> None:
+        """Update Watch Later button label based on current state"""
+        if self._in_watch_later:
+            self.wl_btn.set_label("✓ Saved")
+            self.wl_btn.set_tooltip_text("Remove from Watch Later")
+        else:
+            self.wl_btn.set_label("Watch Later")
+            self.wl_btn.set_tooltip_text("Save for later")
+
+    def _on_watch_later_clicked(self, *_a) -> None:
+        """Toggle Watch Later status"""
+        if self._in_watch_later:
+            # Remove from watch later
+            if remove_from_watch_later(self.video.id):
+                self._in_watch_later = False
+                self._update_wl_button_label()
+                if self.on_toast:
+                    self.on_toast("Removed from Watch Later")
+            else:
+                if self.on_toast:
+                    self.on_toast("Failed to remove from Watch Later")
+        else:
+            # Add to watch later
+            if add_to_watch_later(self.video):
+                self._in_watch_later = True
+                self._update_wl_button_label()
+                if self.on_toast:
+                    self.on_toast("Added to Watch Later")
+            else:
+                if self.on_toast:
+                    self.on_toast("Already in Watch Later")
+
+    def _on_quick_download(self, btn: Gtk.Button, preset_key: str) -> None:
+        """Handle quick quality download button click"""
+        try:
+            opts = get_quick_quality_options(preset_key)
+            
+            if self._on_quick_download:
+                self._on_quick_download(self.video, opts)
+            else:
+                # Fallback to regular download dialog
+                self.on_download_opts(self.video)
+            
+            if self.on_toast:
+                quality = get_preset_label(preset_key)
+                self.on_toast(f"Downloading {self.video.title} ({quality})")
+        except Exception as e:
+            log.exception(f"Quick download failed: {e}")
+            if self.on_toast:
+                self.on_toast(f"Download failed: {e}")
+
+    def _on_toggle_watched(self, btn: Gtk.Button) -> None:
+        """Toggle watched status and remove from watch later if watched"""
+        if is_watched(self.video.id):
+            mark_as_unwatched(self.video.id)
+            btn.set_label("Mark as Watched")
+            if self.on_toast:
+                self.on_toast("Marked as unwatched")
+        else:
+            mark_as_watched(self.video.id)
+            btn.set_label("Mark as Unwatched")
+            
+            # NEW: Auto-remove from watch later when marked watched
+            if is_in_watch_later(self.video.id):
+                from ...watch_later import remove_from_watch_later
+                remove_from_watch_later(self.video.id)
+                if self.on_toast:
+                    self.on_toast("Marked as watched and removed from Watch Later")
+            else:
+                if self.on_toast:
+                    self.on_toast("Marked as watched")
+
+        # This would open a dialog to mark segment boundaries
+        # and submit them to the SponsorBlock database
 
 def _fmt_meta(v: Video) -> str:
-    ch = v.channel or "Unknown channel"
-    dur = v.duration_str
-    base = f"{ch} • {dur}" if dur else ch
+    """Format metadata line with duration, views, date, channel"""
+    parts = []
+    
+    # Channel name
+    if v.channel:
+        parts.append(v.channel)
+    
+    # View count (if available)
+    if v.view_count_str:
+        parts.append(v.view_count_str)
+    
+    # Upload date (if available)
+    if v.upload_date_str:
+        parts.append(v.upload_date_str)
+    
+    # Duration (for videos)
+    if v.duration_str and v.kind == "video":
+        parts.append(v.duration_str)
+    
+    # Kind indicator for non-videos
     if v.kind in ("playlist", "channel"):
-        return f"{base} • {v.kind}"
-    return base
+        parts.append(f"[{v.kind.title()}]")
+    
+    return " • ".join(parts) if parts else "Unknown"
