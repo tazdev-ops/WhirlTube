@@ -9,7 +9,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from .util import load_settings, save_settings  # noqa: E402
+from .util import load_settings, save_settings, _download_archive_path  # noqa: E402
 from .ytdlp_runner import YtDlpRunner, parse_line  # noqa: E402
 
 
@@ -269,14 +269,25 @@ class QuickDownloadWindow(Gtk.Window):
         if self.chk_playlist.get_active():
             args += ["--yes-playlist", "-o", "%(playlist)s/%(title)s.%(ext)s"]
         else:
+            template = self.settings.get("download_template") or "%(title)s.%(ext)s"
             args += [
                 "--break-on-reject",
                 "--match-filter",
                 "!playlist",
                 "--no-playlist",
                 "-o",
-                "%(title)s.%(ext)s",
+                template,
             ]
+
+        # Parity arguments (Task 2)
+        args += [
+            "--download-archive", str(_download_archive_path()),
+            "--no-overwrites",
+            "--continue",
+            "--retries", "3",
+            "--fragment-retries", "2",
+            "-N", "4", # Concurrency
+        ]
 
         args += urls
 
