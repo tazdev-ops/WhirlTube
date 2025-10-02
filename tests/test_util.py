@@ -54,25 +54,25 @@ def test_is_valid_youtube_url_allowed_hosts(url, allowed_hosts, expected):
 def test_safe_httpx_proxy(proxy_str, expected):
     assert safe_httpx_proxy(proxy_str) == expected
 
-@patch("src.whirltube.util.Path.home", return_value=Path("/home/testuser"))
-@patch("src.whirltube.util.os.environ", {"XDG_CONFIG_HOME": "/tmp/config"})
-def test_xdg_config_dir_with_env(mock_env, mock_home, tmp_path):
+def test_xdg_config_dir_with_env(monkeypatch, tmp_path):
     # Mock Path.mkdir to avoid actual FS changes in tests
     with patch("src.whirltube.util.Path.mkdir") as mock_mkdir:
+        monkeypatch.setattr("src.whirltube.util.Path.home", lambda: Path("/home/testuser"))
+        monkeypatch.setattr("src.whirltube.util.os.environ", {"XDG_CONFIG_HOME": "/tmp/config"})
         result = xdg_config_dir()
         assert result == Path("/tmp/config/whirltube")
         mock_mkdir.assert_called_once_with(parents=True, exist_ok=True)
 
-@patch("src.whirltube.util.Path.home", return_value=Path("/home/testuser"))
-@patch("src.whirltube.util.os.environ", {})
-def test_xdg_data_dir_default(mock_home, mock_env, tmp_path):
+def test_xdg_data_dir_default(monkeypatch, tmp_path):
     with patch("src.whirltube.util.Path.mkdir"):
+        monkeypatch.setattr("src.whirltube.util.Path.home", lambda: Path("/home/testuser"))
+        monkeypatch.setattr("src.whirltube.util.os.environ", {})
         result = xdg_data_dir()
         assert result == Path("/home/testuser/.local/share/whirltube")
 
-@patch("src.whirltube.util.Path.home", return_value=Path("/home/testuser"))
-@patch("src.whirltube.util.os.environ", {"XDG_CACHE_HOME": "/tmp/cache"})
-def test_xdg_cache_dir_with_env(mock_env, mock_home, tmp_path):
+def test_xdg_cache_dir_with_env(monkeypatch, tmp_path):
     with patch("src.whirltube.util.Path.mkdir"):
+        monkeypatch.setattr("src.whirltube.util.Path.home", lambda: Path("/home/testuser"))
+        monkeypatch.setattr("src.whirltube.util.os.environ", {"XDG_CACHE_HOME": "/tmp/cache"})
         result = xdg_cache_dir()
         assert result == Path("/tmp/cache/whirltube")

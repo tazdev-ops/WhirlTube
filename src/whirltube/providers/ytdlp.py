@@ -77,10 +77,15 @@ class YTDLPProvider(Provider):
 
     def set_cookies_from_browser(self, spec: str | None) -> None:
         """spec example: 'firefox+gnomekeyring:default::Work'"""
+        # Preserve existing proxy setting before resetting base options
+        prev_proxy = self._opts_base.get("proxy")
+        
         self._opts_base = dict(_BASE_OPTS)
-        if "proxy" in self._opts_base:
-            # re-add proxy if it was in original base options
-            self._opts_base["proxy"] = _BASE_OPTS.get("proxy", None)
+        
+        # Reapply the preserved proxy
+        if prev_proxy:
+            self._opts_base["proxy"] = prev_proxy
+            
         if spec and spec.strip():
             # Add basic validation to prevent malformed cookie specs from causing crashes
             clean_spec = spec.strip()
