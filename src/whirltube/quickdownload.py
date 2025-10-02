@@ -253,17 +253,24 @@ class QuickDownloadWindow(Gtk.Window):
             aq = qual_map[self.dd_audq.get_selected() or 1]
             args += ["-x", "--audio-format", fmt, "--audio-quality", aq]
 
-        # cookies file
+        # cookies file/spec (Task 4)
         ck = self.entry_cookies.get_text().strip()
         if ck:
-            args += ["--cookies", ck]
+            if ":" in ck or "+" in ck:
+                # Treat as browser spec
+                args += ["--cookies-from-browser", ck]
+            elif Path(ck).is_file() and os.access(ck, os.R_OK):
+                # Treat as cookies file path
+                args += ["--cookies", ck]
+            # else: ignore invalid input
 
-        # sponsorblock
+        # sponsorblock (Task 5)
         sb_idx = self.dd_sb.get_selected()
+        cats = self.settings.get("sb_playback_categories", "default")
         if sb_idx == 1:
-            args += ["--sponsorblock-mark", "default"]
+            args += ["--sponsorblock-mark", cats]
         elif sb_idx == 2:
-            args += ["--sponsorblock-remove", "default"]
+            args += ["--sponsorblock-remove", cats]
 
         # playlist mode
         if self.chk_playlist.get_active():
