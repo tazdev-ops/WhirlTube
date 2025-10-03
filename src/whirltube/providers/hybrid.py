@@ -38,8 +38,8 @@ class HybridProvider(Provider):
     def related(self, video_id: str) -> list[Video]:
         return self._robust.related(video_id)
 
-    def comments(self, video_id: str) -> list[Video]:
-        return self._robust.comments(video_id)
+    def comments(self, video_id: str, max_comments: int = 100) -> list[Video]:
+        return self._robust.comments(video_id, max_comments=max_comments)
 
     def channel_tab(self, channel_url: str, tab: str) -> list[Video]:
         return self._robust.channel_tab(channel_url, tab)

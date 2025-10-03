@@ -13,3 +13,7 @@ venv/
 # Ignore editor/backup files
 *.bak
 whirltube-git/
+whirltube/WhirlTube/
+whirltube/src/
+whirltube/*.pkg.tar.zst
+whirltube/src/WhirlTube-*/pkg/

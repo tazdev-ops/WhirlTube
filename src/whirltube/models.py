@@ -25,9 +25,27 @@ class Video:
 
     @property
     def duration_str(self) -> str:
-        if not self.duration or self.duration <= 0:
+        # Handle string durations by parsing to seconds
+        duration_seconds = self.duration
+        if isinstance(duration_seconds, str):
+            try:
+                parts = duration_seconds.split(':')
+                if len(parts) == 2:
+                    # MM:SS format
+                    m, s = map(int, parts)
+                    duration_seconds = m * 60 + s
+                elif len(parts) == 3:
+                    # HH:MM:SS format
+                    h, m, s = map(int, parts)
+                    duration_seconds = h * 3600 + m * 60 + s
+                else:
+                    duration_seconds = None
+            except (ValueError, TypeError):
+                duration_seconds = None
+        
+        if not duration_seconds or duration_seconds <= 0:
             return ""
-        s = self.duration
+        s = int(duration_seconds)
         h = s // 3600
         m = (s % 3600) // 60
         sec = s % 60

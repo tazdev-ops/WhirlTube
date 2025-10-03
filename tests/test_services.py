@@ -1,4 +1,4 @@
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 from src.whirltube.services.native_resolver import get_ios_hls
 
 def test_get_ios_hls_proxy_is_passed():

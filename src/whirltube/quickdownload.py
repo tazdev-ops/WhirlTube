@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import threading
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -11,8 +13,6 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .util import load_settings, save_settings, _download_archive_path  # noqa: E402
 from .ytdlp_runner import YtDlpRunner, parse_line  # noqa: E402
-
-import threading
 
 
 def _notify(summary: str) -> None:
@@ -42,9 +42,14 @@ class QuickDownloadWindow(Gtk.Window):
         self.set_default_size(820, 560)
         self.settings = load_settings()
 
+        header = Adw.HeaderBar()
+        self.set_titlebar(header)
+        close_btn = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        close_btn.connect("clicked", lambda *_: self.close())
+        header.pack_end(close_btn)
+
         root = Adw.ToolbarView()
         self.set_child(root)
-        header = Adw.HeaderBar()
         root.add_top_bar(header)
 
         self.tabview = Adw.TabView()

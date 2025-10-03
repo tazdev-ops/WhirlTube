@@ -5,7 +5,6 @@ Uses ytextractor for playback URL resolution, yt-dlp as fallback for downloads.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 # Check if ytextractor is available
 try:
@@ -138,8 +137,8 @@ class YtExtractorProvider(Provider):
     def related(self, video_id: str) -> list[Video]:
         return self._fallback.related(video_id)
     
-    def comments(self, video_id: str) -> list[Video]:
-        return self._fallback.comments(video_id)
+    def comments(self, video_id: str, max_comments: int = 100) -> list[Video]:
+        return self._fallback.comments(video_id, max_comments=max_comments)
     
     def channel_tab(self, channel_url: str, tab: str) -> list[Video]:
         return self._fallback.channel_tab(channel_url, tab)

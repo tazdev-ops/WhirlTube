@@ -4,14 +4,12 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
-from typing import Any, Callable
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, Gtk
 
-from .util import load_settings, save_settings, xdg_data_dir, safe_httpx_proxy
 
 log = logging.getLogger(__name__)
 
@@ -93,13 +91,18 @@ class DownloadOptions:
         """Build yt-dlp CLI args equivalent to all selected options."""
         parts: list[str] = []
 
+        # Check if audio extraction is requested via extra_flags
+        extra_flags_list = shlex.split(self.extra_flags.strip())
+        is_audio_extraction = "-x" in extra_flags_list or "--extract-audio" in extra_flags_list
+
         # quality
-        if self.quality_mode == "highest":
-            parts += ["-f", "bv*+ba/b"]
-        elif self.quality_mode == "lowest":
-            parts += ["-f", "worst"]
-        elif self.quality_mode == "custom" and self.custom_format:
-            parts += ["-f", self.custom_format]
+        if not is_audio_extraction:
+            if self.quality_mode == "highest":
+                parts += ["-f", "bv*+ba/b"]
+            elif self.quality_mode == "lowest":
+                parts += ["-f", "worst"]
+            elif self.quality_mode == "custom" and self.custom_format:
+                parts += ["-f", self.custom_format]
 
         # format sort
         if self.sort_string.strip():

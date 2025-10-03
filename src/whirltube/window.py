@@ -104,6 +104,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings.setdefault("yt_gl", "US")
         self.settings.setdefault("use_ytextractor", False)  # NEW
         
+        # Keep track of the current download dialog to prevent GC
+        self._current_download_dlg: DownloadOptionsWindow | None = None
+        
         # Initialize provider with global proxy and optional Invidious
         proxy_raw = (self.settings.get("http_proxy") or "").strip()
         proxy = safe_httpx_proxy(proxy_raw) if proxy_raw else None
@@ -136,6 +139,10 @@ class MainWindow(Adw.ApplicationWindow):
         
         # Create cached suggestion client to avoid creating new instances per keystroke
         self._suggestion_client = None
+        self._sugg_timer_id = 0 # Debounce timer for suggestions
+        self._sugg_generation = 0 # Generation counter to prevent out-of-order results
+        self._last_suggestions_key = "" # Last key used for suggestions
+        self._last_suggestions_items: list[str] = [] # Last list of suggestions for comparison
         
         # ToolbarView
         self.toolbar_view = Adw.ToolbarView()
@@ -184,55 +191,64 @@ class MainWindow(Adw.ApplicationWindow):
         self.btn_back.set_tooltip_text("Back")
         header.pack_start(self.btn_back)
         
-        # Menu
+        # Menu - organized by function and usage frequency
         menu = Gio.Menu()
-        menu.append("Preferences", "win.preferences")
-        menu.append("About", "win.about")
-        menu.append("Manage Subscriptions", "win.subscriptions")
-        menu.append("Import Subscriptions…", "win.subs_import")
-        menu.append("Export Subscriptions…", "win.subs_export")
-        menu.append("Keyboard Shortcuts", "win.shortcuts")
-        menu.append("Watch Later", "win.watch_later")
-        menu.append("Clear Watch Later", "win.clear_watch_later")
-        menu.append("Clear Search History", "win.clear_search_history")
-        menu.append("Clear Thumbnail Cache", "win.clear_thumb_cache")
-        menu.append("Download History", "win.download_history")
-        menu.append("Cancel All Downloads", "win.cancel_all_downloads")
-        menu.append("Clear Finished Downloads", "win.clear_finished_downloads")
-        menu.append("Copy URL @ time", "win.mpv_copy_ts")
-        menu.append("System Health Check", "win.health_check")
-        menu.append("Stop MPV", "win.stop_mpv")
-        menu.append("Quit", "app.quit")
+        
+        # Primary application actions (high frequency)
+        primary_section = Gio.Menu()
+        primary_section.append("Preferences", "win.preferences")
+        primary_section.append("Keyboard Shortcuts", "win.shortcuts")
+        primary_section.append("About", "win.about")
+        menu.append_section(None, primary_section)
+
+        # Navigation and Quick Actions (from old primary_btn)
+        nav_section = Gio.Menu()
+        nav_section.append("Open URL…", "win.open_url")
+        nav_section.append("Quick Download", "win.quick_download")
+        nav_section.append("History", "win.history")
+        nav_section.append("Feed", "win.feed")
+        nav_section.append("Trending", "win.trending")
+        menu.append_section("Browse", nav_section)
+        
+        # Content management actions (medium frequency)
+        content_section = Gio.Menu()
+        content_section.append("Watch Later", "win.watch_later")
+        content_section.append("Download History", "win.download_history")
+        content_section.append("Manage Subscriptions", "win.subscriptions")
+        menu.append_section("Library", content_section)
+        
+        # Content maintenance (lower frequency, admin-like actions)
+        maintenance_section = Gio.Menu()
+        maintenance_section.append("Clear Watch Later", "win.clear_watch_later")
+        maintenance_section.append("Clear Search History", "win.clear_search_history")
+        maintenance_section.append("Clear Thumbnail Cache", "win.clear_thumb_cache")
+        maintenance_section.append("Clear Finished Downloads", "win.clear_finished_downloads")
+        menu.append_section("Maintenance", maintenance_section)
+        
+        # Subscriptions management
+        subs_section = Gio.Menu()
+        subs_section.append("Import Subscriptions…", "win.subs_import")
+        subs_section.append("Export Subscriptions…", "win.subs_export")
+        menu.append_section("Subscriptions", subs_section)
+        
+        # Playback and system functions
+        system_section = Gio.Menu()
+        system_section.append("Copy URL @ time", "win.mpv_copy_ts")
+        system_section.append("Stop MPV", "win.stop_mpv")
+        system_section.append("System Health Check", "win.health_check")
+        system_section.append("Cancel All Downloads", "win.cancel_all_downloads")
+        menu.append_section("System", system_section)
+        
+        # Application exit (always at the end)
+        exit_section = Gio.Menu()
+        exit_section.append("Quit", "app.quit")
+        menu.append_section(None, exit_section)
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_btn.set_menu_model(menu)
         header.pack_start(menu_btn)
         
-        # Create primary actions menu (left side)
-        primary_menu = Gio.Menu()
-        primary_menu.append("Open URL…", "win.open_url")
-        primary_menu.append("Quick Download", "win.quick_download")
-        primary_menu.append("Watch Later", "win.watch_later")
-
-        # Sections submenu
-        sections_menu = Gio.Menu()
-        sections_menu.append("History", "win.history")
-        sections_menu.append("Feed", "win.feed")
-        sections_menu.append("Trending", "win.trending")
-        log.debug("Menu item added for trending with action 'win.trending'")
-        primary_menu.append_section("Browse", sections_menu)
-
-        primary_btn = Gtk.MenuButton(icon_name="folder-open-symbolic")
-        primary_btn.set_menu_model(primary_menu)
-        primary_btn.set_tooltip_text("Browse")
-        header.pack_start(primary_btn)
-
-        # NEW: Watch Later button with count badge (keep this minimal one to show importance)
-        self.btn_watch_later = Gtk.Button(icon_name="bookmark-new-symbolic")  # Use icon instead
-        self._update_watch_later_button()
-        self.btn_watch_later.set_can_focus(True)
-        self.btn_watch_later.set_tooltip_text("Videos saved for later")
-        self.btn_watch_later.connect("clicked", self._on_watch_later)
-        header.pack_start(self.btn_watch_later)
+        # The primary actions menu (primary_btn) and the dedicated Watch Later button
+        # have been merged into the main application menu (menu_btn) for simplification.
 
         # Search with autocomplete
         self.search = Gtk.SearchEntry(hexpand=True)
@@ -388,17 +404,28 @@ class MainWindow(Adw.ApplicationWindow):
         if app_obj:
             self.mpv_controls.install_accelerators(app_obj)
 
+        # Cache MPV accelerators to toggle them when search is focused
+        self._mpv_accels = {
+            "win.mpv_play_pause": ["K", "k"],
+            "win.mpv_seek_back": ["J", "j"],
+            "win.mpv_seek_fwd": ["L", "l"],
+            "win.mpv_speed_down": ["minus", "KP_Subtract"],
+            "win.mpv_speed_up": ["equal", "KP_Add"],
+            "win.mpv_copy_ts": ["T", "t"],
+            "win.stop_mpv": ["X", "x"],
+        }
+        # Toggle accelerators when search gains/loses focus
+        self.search.connect("notify::has-focus", self._on_search_focus_changed)
+
+        # If the entry starts focused, disable accelerators immediately
+        if self.search.has_focus():
+            self._set_mpv_accels_enabled(False)
+
         # Track current URL for timestamp copying
         self._mpv_current_url: str | None = None
         self._last_filters: dict[str, str] | None = None
 
-    def _update_watch_later_button(self) -> None:
-        """Update Watch Later button label with count badge"""
-        count = get_watch_later_count()
-        if count > 0:
-            self.btn_watch_later.set_label(f"Watch Later ({count})")
-        else:
-            self.btn_watch_later.set_label("Watch Later")
+
 
     def _create_search_suggestions(self) -> None:
         """Create search suggestions popover"""
@@ -436,44 +463,70 @@ class MainWindow(Adw.ApplicationWindow):
         # Store reference to scroll for dynamic sizing
         self._suggestions_scroll = scroll
         
-        # Connect row activation
+        # Connect row-activated to handle clicks on individual rows
         self._suggestions_list.connect("row-activated", self._on_suggestion_selected)
 
     def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
-        """Handle search text changes for autocomplete"""
+        """Handle search text changes for autocomplete with debouncing and latest-only guard."""
         text = entry.get_text().strip()
-        
-        # Only show suggestions if text is not empty and not just activated
+
+        # Cancel previous timer if it exists
+        if self._sugg_timer_id:
+            GLib.source_remove(self._sugg_timer_id)
+            self._sugg_timer_id = 0
+
         if not text:
             self._search_suggestions_popover.popdown()
             return
 
-        # Local suggestions (existing)
-        local = search_history_suggestions(text, limit=5)
+        def fire():
+            # bump generation
+            self._sugg_generation += 1
+            gen = self._sugg_generation
+            prefix = text
 
-        # Remote suggestions - use configured provider
-        def worker():
-            remote = []
-            try:
-                # Use self.provider instead of creating new client
-                remote = self.provider.suggestions(text, max_items=10)
-                log.debug(f"Got {len(remote)} remote suggestions for '{text}'")
-            except Exception as e:
-                log.warning(f"Remote suggestions failed: {e}")
+            def worker():
+                # Local suggestions (existing) - moved to worker thread to prevent UI blocking
+                local = search_history_suggestions(prefix, limit=5)
+                
                 remote = []
-            
-            # merge + dedupe
-            merged, seen = [], set()
-            for s in local + remote:
-                if s and s.lower() not in seen:
-                    seen.add(s.lower())
-                    merged.append(s)
-            
-            log.debug(f"Total suggestions: {len(merged)}")
-            GLib.idle_add(self._populate_suggestions_list, merged[:10])
+                try:
+                    # Use self.provider instead of creating new client
+                    remote = self.provider.suggestions(prefix, max_items=10)
+                    log.debug(f"Got {len(remote)} remote suggestions for '{prefix}'")
+                except Exception as e:
+                    log.warning(f"Remote suggestions failed: {e}")
+                    remote = []
+                
+                # If user kept typing, drop this result (generation guard)
+                if gen != self._sugg_generation or self.search.get_text().strip() != prefix:
+                    log.debug(f"Suggestions for '{prefix}' dropped (generation mismatch or text changed)")
+                    return
+                
+                # merge + dedupe
+                merged, seen = [], set()
+                for s in (local + remote):
+                    if s and (s.lower() not in seen):
+                        seen.add(s.lower())
+                        merged.append(s)
+                
+                # Avoid re-render if same list for same key
+                if self._last_suggestions_key == prefix and self._last_suggestions_items == merged[:10]:
+                    return
+                
+                self._last_suggestions_key = prefix
+                self._last_suggestions_items = merged[:10]
+                
+                log.debug(f"Total suggestions: {len(merged)}")
+                GLib.idle_add(self._populate_suggestions_list, merged[:10])
 
-        import threading
-        threading.Thread(target=worker, daemon=True).start()
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+            self._sugg_timer_id = 0
+            return False
+
+        # Debounce ~180ms
+        self._sugg_timer_id = GLib.timeout_add(180, fire)
 
     def _populate_suggestions_list(self, items: list[str]) -> bool:
         # Clear list and repopulate
@@ -501,6 +554,7 @@ class MainWindow(Adw.ApplicationWindow):
             label.set_max_width_chars(50)  # Prevent extremely wide suggestions
             row.set_child(label)
             row._suggestion_text = s
+            
             self._suggestions_list.append(row)
         
         # Update size to match search entry width
@@ -528,15 +582,20 @@ class MainWindow(Adw.ApplicationWindow):
             return
         
         suggestion = row._suggestion_text
-        self.search.set_text(suggestion)
+        
+        # Immediately hide the popover before doing anything else
         self._search_suggestions_popover.popdown()
         
-        # Trigger search
-        add_search_term(suggestion)
-        self._run_search(suggestion)
-
-        # Save settings on window close
-        self.connect("close-request", self._on_main_close)
+        # Set the text and grab focus back to search
+        self.search.set_text(suggestion)
+        self.search.grab_focus()
+        
+        # Schedule the search to happen just after UI updates
+        def do_search():
+            add_search_term(suggestion)
+            self._run_search(suggestion)
+            return False  # Don't repeat
+        GLib.idle_add(do_search)
 
         # Clean up old thumbnails on startup (runs in background)
         def _cleanup_cache():
@@ -561,13 +620,6 @@ class MainWindow(Adw.ApplicationWindow):
         if app:
             app.set_accels_for_action("win.focus_search", ["<Primary>f", "<Primary>F"])
 
-        # NEW: Add spacebar toggle play action
-        toggle_play = Gio.SimpleAction.new("toggle_play", None)
-        toggle_play.connect("activate", lambda *_: self.playback_service.cycle_pause() if self.playback_service.is_running() else None)
-        self.add_action(toggle_play)
-        if app:
-            app.set_accels_for_action("win.toggle_play", ["space"])
-
     def _on_mpv_started(self, mode: str):
         """Called when MPV playback starts"""
         self.mpv_controls.get_ctrl_bar().set_visible(self._is_mpv_controls_visible())
@@ -583,6 +635,16 @@ class MainWindow(Adw.ApplicationWindow):
             self._mpv_stop_action.set_enabled(False)
         except AttributeError:
             pass
+
+    def _on_search_focus_changed(self, _widget, _pspec) -> None:
+        self._set_mpv_accels_enabled(not self.search.has_focus())
+
+    def _set_mpv_accels_enabled(self, enabled: bool) -> None:
+        app = self.get_application()
+        if not app:
+            return
+        for act, keys in getattr(self, "_mpv_accels", {}).items():
+            app.set_accels_for_action(act, keys if enabled else [])
 
     def _show_toast(self, text: str) -> None:
         try:
@@ -611,23 +673,31 @@ class MainWindow(Adw.ApplicationWindow):
     def _install_key_controller(self) -> None:
         ctrl = Gtk.EventControllerKey()
         def on_key(_c, keyval, keycode, state):
-            # Handle search suggestions navigation
-            if self.search.has_focus() and hasattr(self, '_search_suggestions_popover'):
-                if self._search_suggestions_popover.get_visible():
-                    from gi.repository import Gdk
-                    k = Gdk.keyval_name(keyval)
-                    
-                    if k == "Down":
-                        # Focus first suggestion
+            k = (Gdk.keyval_name(keyval) or "").lower()
+
+            # If search has focus, handle suggestion nav only; block MPV hotkeys
+            if self.search.has_focus():
+                if hasattr(self, '_search_suggestions_popover') and self._search_suggestions_popover.get_visible():
+                    if k == "down":
                         first_row = self._suggestions_list.get_row_at_index(0)
                         if first_row:
                             self._suggestions_list.select_row(first_row)
                         return True
-                    elif k == "Escape":
+                    if k == "escape":
                         self._search_suggestions_popover.popdown()
                         return True
-            
-            # Existing MPV controls
+                    # Accept first/selected suggestion with Return/Tab
+                    if k in ("return", "kp_enter", "tab"):
+                        row = self._suggestions_list.get_selected_row()
+                        if not row:
+                            row = self._suggestions_list.get_row_at_index(0)
+                        if row:
+                            self._on_suggestion_selected(self._suggestions_list, row)
+                            return True
+                # Let the entry receive the key (don’t let MPV handle it)
+                return False
+
+            # Existing MPV controls only when entry not focused
             return self.mpv_controls.handle_key_press(keyval, keycode, state)
         
         ctrl.connect("key-pressed", on_key)
@@ -773,8 +843,8 @@ class MainWindow(Adw.ApplicationWindow):
         grp_play.append(Gtk.ShortcutsShortcut(title="Play/Pause", accelerator="K"))
         grp_play.append(Gtk.ShortcutsShortcut(title="Seek backward 10s", accelerator="J"))
         grp_play.append(Gtk.ShortcutsShortcut(title="Seek forward 10s", accelerator="L"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Speed down", accelerator="-"))
-        grp_play.append(Gtk.ShortcutsShortcut(title="Speed up", accelerator="="))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Speed down", accelerator="minus"))
+        grp_play.append(Gtk.ShortcutsShortcut(title="Speed up", accelerator="equal"))
         grp_play.append(Gtk.ShortcutsShortcut(title="Stop", accelerator="X"))
         # Assemble: Add groups to section using add_group
         sec.add_group(grp_nav)
@@ -906,7 +976,6 @@ class MainWindow(Adw.ApplicationWindow):
             if response == "clear":
                 cleared = clear_watch_later()
                 self._show_toast(f"Cleared {cleared} video(s) from Watch Later")
-                self._update_watch_later_button()
                 # Refresh view if currently showing watch later
                 if self.stack.get_visible_child_name() == "results":
                     current_results = len([c for c in self.results_box])
@@ -1131,7 +1200,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_watch_later(self, *_a) -> None:
         """Show watch later queue, filtering out watched videos"""
-        from .subscription_feed import is_watched
         
         vids = list_watch_later()
         
@@ -1439,7 +1507,9 @@ class MainWindow(Adw.ApplicationWindow):
     # ---------- Downloads ----------
 
     def _download_options(self, video: Video) -> None:
+        log.debug("_download_options called for: %s", video.title)
         dlg = DownloadOptionsWindow(self, video.title)
+        self._current_download_dlg = dlg # Keep a strong reference
 
         def fetch_formats(_btn):
             dlg.begin_format_fetch()
@@ -1457,6 +1527,8 @@ class MainWindow(Adw.ApplicationWindow):
             accepted, opts = dlg.get_options()
             if accepted:
                 self._download_video_with_options(video, opts)
+            # Clear the strong reference when the dialog is closed
+            self._current_download_dlg = None
 
         dlg.connect("close-request", after_close)
 
@@ -1507,6 +1579,21 @@ class MainWindow(Adw.ApplicationWindow):
 
 
 def _spacer(px: int) -> Gtk.Box:
+    b = Gtk.Box()
+    b.set_size_request(-1, px)
+    return Gtk.Box()
+    b = Gtk.Box()
+    b.set_size_request(-1, px)
+    return bm_settings(
+        search_entry=self.search,
+        run_search_func=self._run_search,
+    )
+
+
+def _spacer(px: int) -> Gtk.Box:
+    b = Gtk.Box()
+    b.set_size_request(-1, px)
+    return Gtk.Box()
     b = Gtk.Box()
     b.set_size_request(-1, px)
     return b

@@ -58,7 +58,11 @@ class DownloadTask:
                 self.progress.status = "finished"
                 self.progress.filename = d.get("filename")
                 on_update(self.progress)
-
+            # ✅ NEW: Handle 'skipped' status (when video is in archive)
+            elif st == "skipped":
+                self.progress.status = "finished"
+                self.progress.filename = "(already downloaded, skipped)"
+                on_update(self.progress)
         def run() -> None:
             self.progress.status = "downloading"
             on_update(self.progress)
@@ -210,16 +214,35 @@ class RunnerDownloadTask:
         template = self._outtmpl_template or "%(title)s.%(ext)s"
         outtmpl = str(self.dest_dir / template)
         args = ["-o", outtmpl] + self.cli_args + [self.video.url]
-        self._runner.start(args, bin_path=self._bin_path)
+        
+        try:
+            ok = self._runner.start(args, bin_path=self._bin_path)
+        except Exception as e:
+            self.progress.status = "error"
+            self.progress.error = f"yt-dlp spawn failed: {e}"
+            if self._on_update:
+                self._on_update(self.progress)
+            return
 
         def watch() -> None:
             # Poll until process exits, then mark finished if no error
             while self._runner.is_running():
                 threading.Event().wait(0.2)
+            
+            # Check exit code if the process object is still available
+            proc = self._runner._proc
+            returncode = proc.returncode if proc else None
+            
             if self.progress.status != "error":
-                self.progress.status = "finished"
-                if self._on_update:
-                    self._on_update(self.progress)
+                if returncode is not None and returncode != 0:
+                    # Process exited with an error code, but no error line was parsed.
+                    self.progress.status = "error"
+                    self.progress.error = f"yt-dlp process exited with code {returncode}. Check logs for details."
+                else:
+                    self.progress.status = "finished"
+                
+            if self._on_update:
+                self._on_update(self.progress)
 
         self._watcher = threading.Thread(target=watch, daemon=True)
         self._watcher.start()
@@ -254,7 +277,15 @@ class RunnerDownloadTask:
                 if self._on_update:
                     self._on_update(self.progress)
             elif ev.kind in ("end_of_video", "end_of_playlist"):
-                # watch() will set finished upon process exit
+                # ✅ NEW: Detect skip due to archive
+                # If we get end_of_video but never saw any download progress,
+                # the video was skipped (already in archive)
+                if self.progress.bytes_downloaded == 0 and self.progress.status == "downloading":
+                    self.progress.status = "finished"
+                    self.progress.filename = "(already downloaded, skipped)"
+                    if self._on_update:
+                        self._on_update(self.progress)
+                # Don't set finished here; watcher thread does that
                 pass
 
     def stop(self) -> None:

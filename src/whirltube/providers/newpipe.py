@@ -69,10 +69,10 @@ class NewPipeProvider(Provider):
         log.warning("NewPipe related() not implemented")
         return []
 
-    def comments(self, video_id: str) -> List[Video]:
+    def comments(self, video_id: str, max_comments: int = 100) -> List[Video]:
         try:
             result = comments_initial(self._http, video_id, hl=self.hl, gl=self.gl)
-            items = result.get("comments", [])
+            items = result.get("comments", [])[:max_comments]
             return [
                 Video(
                     id=c.get("id", ""),

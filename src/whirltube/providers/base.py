@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Protocol, TYPE_CHECKING, Tuple
+from typing import Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..models import Video, Format
+    from ..models import Video
 
 class Provider(Protocol):
     """
@@ -18,7 +18,7 @@ class Provider(Protocol):
     def related(self, video_id: str) -> list[Video]:
         ...
 
-    def comments(self, video_id: str) -> list[Video]:
+    def comments(self, video_id: str, max_comments: int = 100) -> list[Video]:
         ...
 
     def channel_tab(self, channel_url: str, tab: str) -> list[Video]:

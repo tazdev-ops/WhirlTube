@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable
 from copy import deepcopy
@@ -340,6 +338,22 @@ class DownloadManager:
             return False
 
     def start_download(self, video: Video, opts: DownloadOptions) -> None:
+        # Add type validation to handle the case where either parameter might be incorrect
+        # Check if opts is not the expected DownloadOptions type
+        if not isinstance(opts, DownloadOptions):
+            # Log error for debugging
+            log.error(f"start_download called with incorrect opts type: {type(opts)} = {opts!r}")
+            
+            # Create a default DownloadOptions object to prevent the crash
+            opts = DownloadOptions()
+        
+        # Check if video is not the expected Video type (might indicate parameter swap)
+        if not hasattr(video, 'title'):
+            # Log error for debugging - this suggests video parameter is wrong
+            log.error(f"start_download called with incorrect video parameter (no title attribute): {type(video)} = {video!r}")
+            # Return to prevent crash, since we can't proceed without a proper video object
+            return
+        
         dest_dir = opts.target_dir or Path(self.get_setting("download_dir") or str(self.download_dir))
         if not self._ensure_download_dir(dest_dir):
             return
@@ -529,27 +543,30 @@ class DownloadManager:
         )
 
         def _on_update(p: DownloadProgress) -> None:
+            log.debug(f"Download progress: status={p.status}, bytes={p.bytes_downloaded}/{p.bytes_total}, error={p.error}")  # ✅ NEW
             GLib.idle_add(row.update_progress, p)
             if p.status in ("finished", "error"):
                 # Book-keeping on main loop
                 def _done():
                     try:
                         if p.status == "finished":
-                            try:
-                                add_download(video, dest_dir, p.filename)
-                            except Exception:
-                                pass
-                            self.show_toast(f"Downloaded: {video.title}")
-                            _notify(f"Downloaded: {video.title}")
-                            # Auto-open download folder if enabled
-                            try:
-                                if bool(self.get_setting("download_auto_open_folder")):
-                                    self._open_folder(dest_dir)
-                            except Exception:
-                                pass
+                            if p.filename != "(already downloaded, skipped)":
+                                try:
+                                    add_download(video, dest_dir, p.filename)
+                                except Exception:
+                                    pass
+                                self.show_toast(f"Downloaded: {video.title}")
+                                _notify(f"Downloaded: {video.title}")
+                                # Auto-open download folder if enabled
+                                try:
+                                    if bool(self.get_setting("download_auto_open_folder")):
+                                        self._open_folder(dest_dir)
+                                except Exception:
+                                    pass
                         elif p.status == "error":
-                            self.show_toast(f"Download failed: {video.title}")
-                            _notify(f"Download failed: {video.title}")
+                            error_msg = p.error or "Unknown error"
+                            self.show_toast(f"Download failed: {video.title} ({error_msg})")
+                            _notify(f"Download failed: {video.title} ({error_msg})")
                     finally:
                         with self._lock:
                             self._active = max(0, self._active - 1)

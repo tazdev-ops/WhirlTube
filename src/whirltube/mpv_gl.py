@@ -24,7 +24,7 @@ class MpvGLWidget(Gtk.GLArea):
         self.set_hexpand(True)
         self.set_vexpand(True)
         self._mpv: Optional[mpv.MPV] = None
-        self._gl_cb: Optional[mpv.opengl_cb.GLCallback] = None
+        self._gl_cb: Optional[mpv.GLCallback] = None
         self._ready = False
         self.connect("realize", self._on_realize)
         self.connect("unrealize", self._on_unrealize)
@@ -63,7 +63,7 @@ class MpvGLWidget(Gtk.GLArea):
                 mpv_kwargs["opengl_es"] = True
 
             self._mpv = mpv.MPV(**mpv_kwargs)
-            self._gl_cb = mpv.opengl_cb.GLCallback(self._mpv)
+            self._gl_cb = mpv.GLCallback(self._mpv)
 
             def _get_proc_address(name: str) -> int:
                 addr = self.get_proc_address(name)

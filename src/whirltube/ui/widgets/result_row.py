@@ -141,11 +141,20 @@ class ResultRow(Gtk.Box):
         # Buttons
         btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         if video.is_playable:
-            play_btn = Gtk.Button(label="Play")
+            # Primary action: Play
+            play_btn = Gtk.Button(label="▶️ Play")
             play_btn.connect("clicked", self._on_play_clicked)
             btn_box.append(play_btn)
             
-            # NEW: Quick quality download buttons in a horizontal box
+            # Personal management: Watch Later
+            self._in_watch_later = is_in_watch_later(video.id)
+            self.wl_btn = Gtk.Button()
+            self._update_wl_button_label()
+            self.wl_btn.connect("clicked", self._on_watch_later_clicked)
+            btn_box.append(self.wl_btn)
+            
+            # Content availability: Download actions (high priority for users who want to save)
+            # Download section: Quick downloads first, then advanced options
             quick_dl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
             quick_dl_box.set_homogeneous(True)
             
@@ -158,71 +167,100 @@ class ResultRow(Gtk.Box):
                 preset_btn = Gtk.Button(label=get_preset_label(preset_key))
                 preset_btn.set_tooltip_text(get_preset_tooltip(preset_key))
                 preset_btn.add_css_class("flat")
-                preset_btn.connect("clicked", self._on_quick_download, preset_key)
+                preset_btn.connect("clicked", self._on_quick_download_handler, preset_key)
                 quick_dl_box.append(preset_btn)
             
             btn_box.append(quick_dl_box)
             
-            # Original download options button (now labeled "More...")
-            dl_opts_btn = Gtk.Button(label="⚙ More…")
-            dl_opts_btn.set_tooltip_text("Advanced download options")
+            # Advanced download options - make it clearer this is for the single video
+            dl_opts_btn = Gtk.Button(label="⬇️ More…")
+            dl_opts_btn.set_tooltip_text("More download options for this video")
             dl_opts_btn.connect("clicked", self._on_download_clicked)
             btn_box.append(dl_opts_btn)
             
-            # NEW: Watch Later button
-            self._in_watch_later = is_in_watch_later(video.id)
-            self.wl_btn = Gtk.Button()
-            self._update_wl_button_label()
-            self.wl_btn.connect("clicked", self._on_watch_later_clicked)
-            btn_box.append(self.wl_btn)
+            # Content discovery: Related videos (medium priority)
+            related_btn = Gtk.Button(label="🔍 Related")
+            related_btn.set_tooltip_text("Show related videos")
+            related_btn.connect("clicked", lambda *_: self.on_related(self.video))
+            btn_box.append(related_btn)
             
-            # Compact "More…" menu
-            more = Gtk.MenuButton(label="More…")
+            # Content interaction: Comments (lower priority)
+            comments_btn = Gtk.Button(label="💬 Comments")
+            comments_btn.set_tooltip_text("Show comments")
+            comments_btn.connect("clicked", lambda *_: self.on_comments(self.video))
+            btn_box.append(comments_btn)
+            
+            # Compact "More…" menu with remaining actions
+            more = Gtk.MenuButton(label="⋮ Actions")
+            more.set_tooltip_text("Other actions")
             pop = Gtk.Popover()
             vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
             
-            # NEW: Toggle watched status
+            # Content management
             watched = is_watched(self.video.id)
-            b_watch = Gtk.Button(label="Mark as Unwatched" if watched else "Mark as Watched")
+            b_watch = Gtk.Button(label="👁️ Mark as Unwatched" if watched else "👁️ Mark as Watched")
             b_watch.connect("clicked", self._on_toggle_watched)
             vbx.append(b_watch)
             
-            # NEW: SponsorBlock boundary marker
-            
-            b_rel = Gtk.Button(label="Related")
-            b_rel.connect("clicked", lambda *_: self.on_related(self.video))
-            b_cmt = Gtk.Button(label="Comments")
-            b_cmt.connect("clicked", lambda *_: self.on_comments(self.video))
-            b_ch = Gtk.Button(label="Open channel")
+            # Channel interaction
+            b_ch = Gtk.Button(label="📺 Open channel")
             b_ch.set_tooltip_text("Open the uploader's channel")
             b_ch.connect("clicked", lambda *_: self.on_open_channel(self.video))
-            b_web = Gtk.Button(label="Open in Browser")
+            
+            # Sharing actions
+            b_web = Gtk.Button(label="🌐 Open in Browser")
             b_web.connect("clicked", lambda *_: self._open_in_browser())
-            b_cu = Gtk.Button(label="Copy URL")
+            b_cu = Gtk.Button(label="🔗 Copy URL")
             b_cu.connect("clicked", lambda *_: self._copy_url())
-            b_ct = Gtk.Button(label="Copy Title")
+            b_ct = Gtk.Button(label="📋 Copy Title")
             b_ct.connect("clicked", lambda *_: self._copy_title())
-            for b in (b_rel, b_cmt, b_ch, b_web, b_cu, b_ct):
+            
+            # Group remaining actions
+            for b in (b_ch, b_web, b_cu, b_ct):
                 vbx.append(b)
+            
             pop.set_child(vbx)
             more.set_popover(pop)
             btn_box.append(more)
         else:
             # Non-playable kinds
             if self.video.kind == "playlist":
-                open_btn = Gtk.Button(label="Open")
+                open_btn = Gtk.Button(label="▶️ Open")
                 open_btn.set_tooltip_text("Open this playlist")
                 open_btn.connect("clicked", lambda *_: self.on_open(self.video))
                 btn_box.append(open_btn)
-                # Playlist may be downloaded (folder structure)
-                dl_btn = Gtk.Button(label="Download…")
+                # Playlist may be downloaded (folder structure) - using a clearer icon
+                dl_btn = Gtk.Button(label="📦 Download")
+                dl_btn.set_tooltip_text("Download this entire playlist")
                 dl_btn.connect("clicked", lambda *_: self.on_download_opts(self.video))
                 btn_box.append(dl_btn)
             elif self.video.kind == "channel":
-                open_btn = Gtk.Button(label="Open")
+                open_btn = Gtk.Button(label="▶️ Open")
                 open_btn.set_tooltip_text("Open this channel")
                 open_btn.connect("clicked", lambda *_: self.on_open(self.video))
                 btn_box.append(open_btn)
+                label = "Unfollow" if self._followed else "Follow"
+                follow_btn = Gtk.Button(label=label)
+                def _toggle_follow(_btn):
+                    try:
+                        if self._followed:
+                            if self.on_unfollow:
+                                self.on_unfollow(self.video)
+                            self._followed = False
+                            _btn.set_label("Follow")
+                            if self.on_toast:
+                                self.on_toast("Unfollowed channel")
+                        else:
+                            if self.on_follow:
+                                self.on_follow(self.video)
+                            self._followed = True
+                            _btn.set_label("Unfollow")
+                            if self.on_toast:
+                                self.on_toast("Followed channel")
+                    except Exception:
+                        pass
+                follow_btn.connect("clicked", _toggle_follow)
+                btn_box.append(follow_btn)
                 label = "Unfollow" if self._followed else "Follow"
                 follow_btn = Gtk.Button(label=label)
                 def _toggle_follow(_btn):
@@ -249,14 +287,15 @@ class ResultRow(Gtk.Box):
                 # comment or other: no "Open" or "Download…" actions
                 pass
             # Compact "More…" for common actions
-            more = Gtk.MenuButton(label="More…")
+            more = Gtk.MenuButton(label="⋮ Actions")
+            more.set_tooltip_text("Other actions")
             pop = Gtk.Popover()
             vbx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-            b_web = Gtk.Button(label="Open in Browser")
+            b_web = Gtk.Button(label="🌐 Open in Browser")
             b_web.connect("clicked", lambda *_: self._open_in_browser())
-            b_cu = Gtk.Button(label="Copy URL")
+            b_cu = Gtk.Button(label="🔗 Copy URL")
             b_cu.connect("clicked", lambda *_: self._copy_url())
-            b_ct = Gtk.Button(label="Copy Title")
+            b_ct = Gtk.Button(label="📋 Copy Title")
             b_ct.connect("clicked", lambda *_: self._copy_title())
             for b in (b_web, b_cu, b_ct):
                 vbx.append(b)
@@ -537,12 +576,14 @@ class ResultRow(Gtk.Box):
                 if self.on_toast:
                     self.on_toast("Already in Watch Later")
 
-    def _on_quick_download(self, btn: Gtk.Button, preset_key: str) -> None:
+    def _on_quick_download_handler(self, btn: Gtk.Button, preset_key: str) -> None:
         """Handle quick quality download button click"""
         try:
             opts = get_quick_quality_options(preset_key)
             
-            if self._on_quick_download:
+            # Call the MainWindow callback if it exists
+            if self._on_quick_download and callable(self._on_quick_download):
+                # Ensure we're passing the right parameters: Video object and DownloadOptions
                 self._on_quick_download(self.video, opts)
             else:
                 # Fallback to regular download dialog

@@ -6,6 +6,10 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Queue
+from shlex import quote as shlex_quote
+import logging
+
+log = logging.getLogger(__name__)
 
 PREFIX = "WTJSON:"  # marker for JSON lines we emit
 
@@ -36,22 +40,35 @@ class ProgressEvent:
     payload: dict
 
 def parse_line(line: str) -> list[ProgressEvent] | Exception | None:
+    """Parse a line from yt-dlp output. Returns events, error, or None."""
+    
+    # Only treat explicit ERROR lines as errors
     if line.startswith("stderr:ERROR: "):
         return RuntimeError(line[len("stderr:ERROR: ") :].strip())
     if line.startswith("ERROR: "):
         return RuntimeError(line[len("ERROR: ") :].strip())
+    
+    # ✅ CRITICAL FIX: Ignore non-prefixed stderr lines (they're normal yt-dlp chatter)
+    # Before this fix, ANY stderr line would abort the download
     if line.startswith("stderr:") and PREFIX not in line:
-        return RuntimeError(f"yt-dlp error: {line[len('stderr:'):].strip()}")
+        log.debug(f"Ignoring stderr: {line[8:60]}...")  # Log first 60 chars for debugging
+        return None
+    
+    # Parse JSON-prefixed progress events
     idx = line.find(PREFIX)
     if idx < 0:
         return None
+    
     part = line[idx + len(PREFIX) :].strip()
     try:
         obj = json.loads(part.replace("NA", "null"))
         if isinstance(obj, dict) and "type" in obj:
+            log.debug(f"Progress event: {obj['type']}")  # Debug logging
             return [ProgressEvent(obj["type"], obj)]
-    except Exception:
+    except Exception as e:
+        log.debug(f"Failed to parse JSON: {e}")
         return None
+    
     return None
 
 class YtDlpRunner:
@@ -66,6 +83,7 @@ class YtDlpRunner:
     def start(self, args: list[str], bin_path: str | None = None) -> bool:
         self.stop()
         cmd = [bin_path or "yt-dlp"] + args + PRINT_HOOKS + PROGRESS_TPL + ["--no-quiet"]
+        log.debug("Starting yt-dlp: %s", " ".join(shlex_quote(x) for x in cmd))
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -102,6 +120,7 @@ class YtDlpRunner:
                     text = chunk.decode(errors="ignore")
                 except Exception:
                     continue
+                log.debug(f"yt-dlp output ({prefix}): {text[:100]}")  # ✅ NEW: Log raw output
                 self._q.put(prefix + text)
 
         t1 = threading.Thread(target=reader, args=(self._proc.stdout, ""), daemon=True)
@@ -114,6 +133,7 @@ class YtDlpRunner:
                 line = self._q.get(timeout=0.2)
             except Empty:
                 continue
+            log.debug(f"Processing line: {line[:100]}")  # ✅ NEW: Log what we're processing
             self._on_progress(line)
 
         while not self._q.empty():

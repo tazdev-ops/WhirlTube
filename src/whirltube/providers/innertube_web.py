@@ -103,9 +103,9 @@ class InnerTubeWeb(Provider):
             return self._fallback.related(video_id)
         return []
 
-    def comments(self, video_id: str) -> list[Video]:
+    def comments(self, video_id: str, max_comments: int = 100) -> list[Video]:
         if self._fallback:
-            return self._fallback.comments(video_id)
+            return self._fallback.comments(video_id, max_comments=max_comments)
         return []
 
     def channel_tab(self, channel_url: str, tab: str) -> list[Video]:
