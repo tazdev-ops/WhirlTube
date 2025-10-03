@@ -17,3 +17,19 @@ whirltube/WhirlTube/
 whirltube/src/
 whirltube/*.pkg.tar.zst
 whirltube/src/WhirlTube-*/pkg/
+
+# Add missing cache directory
+.mypy_cache/
+
+# Add build artifact files
+build1.sha
+build2.sha
+
+# Additional package build artifacts
+whirltube/src/**/pkg/
+whirltube/*.pkg.tar.zst
+whirltube/pkg/
+whirltube/**/whirltube/*.pkg.tar.zst
+
+# Snapshot utility script output
+important_code_snapshot.txt
