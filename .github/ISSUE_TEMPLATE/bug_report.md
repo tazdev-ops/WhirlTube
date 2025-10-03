@@ -1,13 +1,32 @@
 ---
 name: Bug report
 about: Create a report to help us improve
+title: ''
 labels: bug
+assignees: ''
 ---
 
-- OS/distro:
-- Python version:
-- How installed (AUR/zipapp/source):
-- Steps to reproduce:
-- What happened:
-- What you expected:
-- Logs (run with `WHIRLTUBE_DEBUG=1` and paste relevant lines):
+**Describe the bug**
+A clear and concise description of what the bug is.
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. Go to '...'
+2. Click on '....'
+3. Scroll down to '....'
+4. See error
+
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Screenshots**
+If applicable, add screenshots to help explain your problem.
+
+**Environment (please complete the following information):**
+- OS: [e.g. Ubuntu 22.04, Arch Linux]
+- Python version: [e.g. 3.13]
+- WhirlTube version: [e.g. 0.5.0 or commit hash]
+- Installation method: [e.g. from source, flatpak, etc.]
+
+**Additional context**
+Add any other context about the problem here.

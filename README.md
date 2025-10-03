@@ -2,9 +2,17 @@
 
 **Wayland-first GTK4 YouTube client** with MPV playback and multi-provider backends.
 
-## Status: v0.5.0 (Production-Ready)
+<div align="center">
 
-### Highlights
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
+
+**Status: v0.5.0 (Production-Ready)**
+
+</div>
+
+## Features
+
 - **3 Provider Backends**:
   - **YTDLPProvider** (default) — Heavy, battle-tested, complete
   - **InvidiousProvider** — Privacy-focused, API-based
@@ -19,9 +27,19 @@
 
 ## Requirements
 
-### System (Arch)
+### System Dependencies (Arch Linux)
 ```bash
 sudo pacman -S --needed gtk4 libadwaita python-gobject mpv ffmpeg
+```
+
+### System Dependencies (Ubuntu/Debian)
+```bash
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 libmpv-dev mpv ffmpeg
+```
+
+### System Dependencies (Fedora)
+```bash
+sudo dnf install python3-gobject gtk4-devel libadwaita-devel mpv-libs mpv ffmpeg
 ```
 
 ### Optional (for providers)
@@ -39,14 +57,27 @@ pip install python-mpv PyOpenGL
 
 ---
 
-## Install
+## Installation
 
-### From Source
+### From Source (Development)
 ```bash
-git clone https://github.com/yourusername/whirltube.git
-cd whirltube
+git clone https://github.com/tazdev-ops/WhirlTube.git
+cd WhirlTube
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install --upgrade pip
 pip install -e .[dev]
 whirltube
+```
+
+### From PyPI (when available)
+```bash
+pip install whirltube
+```
+
+### Flatpak (when available)
+```bash
+flatpak install --from https://example.com/whirltube.flatpakref
 ```
 
 ### Debug Mode

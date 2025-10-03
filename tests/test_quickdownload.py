@@ -36,6 +36,8 @@ https://test.com/video2"""
     mock_window.entry_path_audio.get_text.return_value = "/tmp/audio"
     mock_window.entry_ytdlp.get_text.return_value = "/usr/bin/yt-dlp"
     mock_window.entry_cookies.get_text.return_value = ""
+    mock_window.spin_concurrency = Mock()
+    mock_window.spin_concurrency.get_value.return_value = 4  # Default concurrency
     
     # Mock tab view state (Video tab selected)
     mock_page = Mock()
@@ -139,6 +141,8 @@ def test_quick_args_playlist_mode():
     mock_window.dd_vidfmt.get_selected.return_value = 0
     mock_window.chk_playlist.get_active.return_value = True # <--- Playlist mode ON
     mock_window.dd_sb.get_selected.return_value = 0
+    mock_window.spin_concurrency = Mock()
+    mock_window.spin_concurrency.get_value.return_value = 4  # Default concurrency
     mock_window.runner = Mock()
     mock_window.progress = Mock()
     mock_window._set_msg = Mock()

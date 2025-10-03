@@ -1,3 +1,9 @@
+"""Download manager for WhirlTube.
+
+This module handles the download queue, progress tracking, and UI
+elements for managing video downloads.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -39,6 +45,10 @@ def _notify(summary: str) -> None:
         pass
 
 class DownloadRow(Gtk.Box):
+    """UI element representing a single download in the queue.
+    
+    This widget displays the progress and controls for a single download task.
+    """
     def __init__(self, task: Any | None = None, title: str | None = None, on_cancel: Callable[[], None] | None = None, on_retry: Callable[[], None] | None = None, on_remove: Callable[[], None] | None = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.task = task

@@ -45,8 +45,7 @@ def test_parse_line_error_no_prefix():
 def test_parse_line_error_stderr_other():
     line = "stderr:Some other error message."
     result = parse_line(line)
-    assert isinstance(result, RuntimeError)
-    assert str(result) == "yt-dlp error: Some other error message."
+    assert result is None  # Non-error stderr lines should be ignored, not raise exceptions
 
 def test_parse_line_with_na_values():
     # yt-dlp sometimes outputs 'NA' for null values, which needs to be replaced

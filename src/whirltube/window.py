@@ -1,3 +1,9 @@
+"""Main application window for WhirlTube.
+
+This module contains the primary application window and its associated
+functionality including UI elements, navigation, and application logic.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -63,7 +69,18 @@ log = logging.getLogger(__name__)
 
 
 class MainWindow(Adw.ApplicationWindow):
+    """Main application window for WhirlTube.
+    
+    This class represents the main application window containing all UI elements
+    and managing the primary application flow including video playback, search,
+    downloads, and user interactions.
+    """
     def __init__(self, app: Adw.Application) -> None:
+        """Initialize the main application window.
+        
+        Args:
+            app: The Adwaita application instance
+        """
         super().__init__(application=app, title="WhirlTube")
         # Load settings first, then apply persisted window size
         self.settings = load_settings()

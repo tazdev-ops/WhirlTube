@@ -1,3 +1,10 @@
+"""Data models for WhirlTube.
+
+This module contains dataclasses that represent the core data structures
+used throughout the application, including Video, Format, and other
+entities.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +12,14 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class Format:
+    """Represents a media format available for download/playback.
+    
+    Attributes:
+        format_id: Unique identifier for the format
+        label: Human-readable label for the format
+        url: URL to the media resource (optional)
+        filesize: Size of the media file in bytes (optional)
+    """
     format_id: str
     label: str
     url: str | None = None
@@ -13,6 +28,19 @@ class Format:
 
 @dataclass(slots=True)
 class Video:
+    """Represents a video or other media item.
+    
+    Attributes:
+        id: Unique identifier for the video
+        title: Title of the video
+        url: URL to the video
+        channel: Name of the channel that published the video
+        duration: Duration of the video in seconds
+        thumb_url: URL to the thumbnail image
+        kind: Type of media (video, playlist, channel, comment)
+        view_count: Number of views for the video
+        upload_date: Upload date in YYYYMMDD format
+    """
     id: str
     title: str
     url: str

@@ -4,12 +4,29 @@ build-backend = "hatchling.build"
 
 [project]
 name = "whirltube"
-version = "0.4.5"
-description = "WhirlTube: lightweight GTK4 frontend for YouTube using mpv and yt-dlp"
+version = "0.5.1"
+description = "Wayland-first GTK4 YouTube client with MPV playback and multi-provider backends"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
-authors = [{ name = "WhirlTube contributors" }]
-requires-python = ">=3.12"
+authors = [
+    { name = "WhirlTube contributors" },
+]
+maintainers = [
+    { name = "tazdev-ops", email = "tazdev-ops@github.com" },
+]
+requires-python = ">=3.13"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+keywords = ["youtube", "gtk4", "mpv", "video-player", "wayland", "media-player"]
 dependencies = [
   "httpx>=0.27",
   "yt-dlp>=2024.8.6",
